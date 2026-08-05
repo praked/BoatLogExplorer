@@ -132,8 +132,15 @@ def load_log(source, log_id: str | None = None, size: int | None = None) -> Log:
         df[name] = (pd.to_numeric(raw[src], errors="coerce").astype(dtype)
                     if src is not None else np.array(np.nan, dtype=dtype))
 
+    # Deliberately category rather than the nullable "string" dtype: this frame
+    # gets pickled by Streamlit's cache, and StringDtype does not survive that
+    # round-trip on older pandas builds (notably the one bundled with Pyodide,
+    # which raises NotImplementedError on unpickling). heading_source holds only
+    # a handful of distinct values, so category is also far smaller.
     src = cols.get("heading_source")
-    df["heading_source"] = (raw[src].astype("string").fillna("") if src is not None else "")
+    values = (raw[src].astype(object).where(raw[src].notna(), "")
+              if src is not None else pd.Series("", index=raw.index))
+    df["heading_source"] = pd.Series(values.to_numpy(), index=df.index).astype("category")
 
     df = df[df["t"].notna()].reset_index(drop=True)
     if df.empty:
