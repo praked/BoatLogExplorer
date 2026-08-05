@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.streamlit/secrets.toml
+
+# Raw flight/sail logs stay out of git: the 4Aug2026 set alone is ~101 MB and
+# one file is 64 MB, past the size GitHub warns about. Trimmed extracts live in
+# sample_logs/ instead. Point the app's folder box at a local directory to use
+# the full recordings.
+logs_4Aug2026/
+logf/
+logh/
+logs/
+boat_log_*.csv
+!sample_logs/*.csv
+# The Pages build serves its own copy of the samples; they must be tracked or
+# the hosted app comes up with no data to show.
+!docs/sample_logs/*.csv
