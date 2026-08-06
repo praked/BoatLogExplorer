@@ -236,8 +236,15 @@ readout_slot = st.empty()
 
 
 def _set_range(a, b):
-    st.session_state[sel_key] = (_as_utc(a).to_pydatetime(),
-                                 _as_utc(b).to_pydatetime())
+    """Store a preset selection, clamped to the axis.
+
+    A preset can overshoot: "Moving only" pads by 30 s, and motion often starts
+    or ends within 30 s of the log's own bounds. The slider rejects a stored
+    value outside [min_value, max_value] on the following run.
+    """
+    a, b = _as_utc(a), _as_utc(b)
+    st.session_state[sel_key] = (min(max(a, t_lo), t_hi).to_pydatetime(),
+                                 min(max(b, t_lo), t_hi).to_pydatetime())
 
 
 # Changing the log selection changes the time axis, and a selection carried
