@@ -16,7 +16,7 @@ from boatviz import charts, derive, export, mapview
 from boatviz.ingest import (STATUS_EMPTY, STATUS_ERROR, STATUS_FRAGMENT,
                             STATUS_NO_GPS, STATUS_OK, discover_logs, load_log)
 from boatviz.qa import ABSENT, ALIVE, CONSTANT, FROZEN, PARTIAL, assess
-from boatviz.schema import CHANNELS
+from boatviz.schema import CHANNELS, MODE_LABELS, POWER_CHANNELS
 
 st.set_page_config(page_title="Boat Log Explorer", page_icon="⛵",
                    layout="wide", initial_sidebar_state="expanded")
@@ -176,6 +176,20 @@ def _as_utc(value):
     """Streamlit's slider may hand back naive or tz-aware datetimes."""
     ts = pd.Timestamp(value)
     return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+
+def _recorded(frame, col):
+    """True when a categorical column exists and holds a value in this frame.
+
+    The nav and power columns arrived in a later firmware revision, so every
+    feature built on them has to cope with logs that predate it.
+    """
+    return col in frame.columns and bool((frame[col].astype(str) != "").any())
+
+
+def _has_power(log):
+    return any(ch.power in log.df.columns and log.df[ch.power].notna().any()
+               for ch in POWER_CHANNELS)
 
 
 def apply_time_filter(logs_, t0, t1):
@@ -370,8 +384,8 @@ with st.sidebar.expander("Sensor health", expanded=True):
 
 # ----------------------------------------------------------------------- tabs
 
-tab_map, tab_series, tab_compass, tab_data = st.tabs(
-    ["Map", "Time series", "Compass check", "Data"])
+tab_map, tab_series, tab_power, tab_compass, tab_data = st.tabs(
+    ["Map", "Time series", "Battery", "Compass check", "Data"])
 
 
 with tab_map:
@@ -379,8 +393,17 @@ with tab_map:
 
     with ctrl:
         basemap = st.selectbox("Basemap", list(mapview.BASEMAPS), index=0)
-        color_by = st.selectbox("Colour by",
-                                ["log", "time", "speed", "heading", "awa"], index=0)
+
+        # Mode is offered only when a log actually carries it: on older logs the
+        # option would silently colour the whole track one "not recorded" grey.
+        color_choices = ["log", "time", "speed", "heading", "awa"]
+        if any(_recorded(lg.fix, "mode") for lg in selected):
+            color_choices.insert(1, "mode")
+        color_by = st.selectbox(
+            "Colour by", color_choices, index=0,
+            format_func=lambda c: "control mode" if c == "mode" else c,
+            help="Control mode splits the track by what was steering the boat — "
+                 "RC, autonomous, or hybrid." if "mode" in color_choices else None)
         st.divider()
 
         show_track = st.checkbox("Track line", True)
@@ -435,6 +458,16 @@ with tab_map:
         # the app to packages that also run in a browser-hosted build.
         components.html(m.get_root().render(), height=680, scrolling=False)
 
+        if color_by == "mode":
+            present = sorted({v for lg in selected
+                              for v in lg.view.get("mode", pd.Series(dtype=str))
+                                              .astype(str).unique() if v})
+            st.caption(" · ".join(
+                f"**{name}** — {MODE_LABELS[name]}" if name in MODE_LABELS
+                else f"**{name}** — not a mode this app knows; check "
+                     "`utils/modes.py` in the firmware"
+                for name in present) or "No control mode recorded in this window.")
+
         if moving_only and n_moving == 0:
             st.info("No fixes in this window exceed the moving threshold, so the "
                     "map is empty. Lower the threshold or widen the time window.")
@@ -470,7 +503,86 @@ with tab_series:
                                        [c.key for c in CHANNELS])
         if strip:
             st.caption(f"**{lg.id.replace('boat_log_', '')}**")
-            st.plotly_chart(strip, width='stretch')
+            # Streamlit derives a chart's identity from its contents, so two
+            # logs that happen to produce identical figures collide. Every
+            # chart drawn once per log therefore carries the log id as its key.
+            st.plotly_chart(strip, width='stretch', key=f"strip_{lg.id}")
+
+
+with tab_power:
+    powered = [lg for lg in selected if _has_power(lg)]
+
+    if not powered:
+        st.info("**No power monitor in these logs.** The `ch1`–`ch3` columns "
+                "arrived with the INA3221 in a later firmware revision; logs "
+                "recorded before it have nothing to show here.")
+    else:
+        st.caption(
+            "Three INA3221 channels, logged as bus power in **watts** and "
+            "current in **amps** exactly as the driver reports them. Energy "
+            "covers the selected time window only, integrated over the raw rows "
+            "rather than GPS fixes. Which load sits on which channel is a wiring "
+            "choice the firmware does not record, so they stay numbered.")
+
+        for lg in powered:
+            st.subheader(lg.id.replace("boat_log_", ""))
+            rows = derive.power_summary(lg.df_view)
+            live = [r for r in rows if r["present"]]
+
+            if not live:
+                st.warning("No power samples inside the selected time window.")
+                continue
+
+            total_wh = sum(r["energy_wh"] for r in live)
+            mean_w = sum(r["mean_w"] for r in live)
+            peak_total = sum(r["peak_w"] for r in live)
+
+            a, b, c, d = st.columns(4)
+            a.metric("Energy used", f"{total_wh:.2f} Wh")
+            b.metric("Mean draw", f"{mean_w:.2f} W")
+            c.metric("Peak, channels summed", f"{peak_total:.2f} W",
+                     help="Sum of each channel's own peak, so it is an upper "
+                          "bound — the peaks need not have coincided.")
+            d.metric("Window", _fmt_span(sel_span))
+
+            table = pd.DataFrame([{
+                "Channel": r["label"],
+                "Samples": r["n"],
+                "Mean (W)": r["mean_w"],
+                "Peak (W)": r["peak_w"],
+                "Energy (Wh)": r["energy_wh"],
+                "Mean (A)": r["mean_a"],
+                "Peak (A)": r["peak_a"],
+                "Bus (V)": r["bus_v"],
+            } for r in rows])
+
+            st.dataframe(
+                table.style.format({
+                    "Samples": "{:,}", "Mean (W)": "{:.2f}", "Peak (W)": "{:.2f}",
+                    "Energy (Wh)": "{:.3f}", "Mean (A)": "{:.3f}",
+                    "Peak (A)": "{:.3f}", "Bus (V)": "{:.2f}"}, na_rep="–"),
+                width="stretch", hide_index=True, key=f"power_table_{lg.id}")
+            st.caption("**Bus (V)** is not logged — it is power ÷ current, which "
+                       "recovers it because the driver computes power as bus "
+                       "voltage × current. Only samples drawing more than "
+                       f"{derive.CURRENT_NOISE_A * 1000:.0f} mA count, so an "
+                       "unloaded channel shows no voltage rather than noise ÷ noise.")
+
+            flat = [r["label"] for r in live
+                    if r["peak_w"] == 0.0 and not r["peak_a"] > 0]
+            if flat:
+                one = len(flat) == 1
+                st.warning(
+                    f"**{', '.join(flat)} read a flat zero for this whole "
+                    f"window.** Either nothing is wired to "
+                    f"{'that channel' if one else 'those channels'}, or the "
+                    f"shunt is open and the rail is drawing current the monitor "
+                    f"cannot see.")
+
+            fig = charts.power_timeseries(lg)
+            if fig:
+                st.plotly_chart(fig, width="stretch", key=f"power_{lg.id}")
+            st.divider()
 
 
 with tab_compass:
@@ -513,10 +625,10 @@ with tab_compass:
             a, b = st.columns(2)
             f1 = charts.residual_timeseries(lg.view if len(lg.view) else lg.fix)
             if f1:
-                a.plotly_chart(f1, width='stretch')
+                a.plotly_chart(f1, width='stretch', key=f"resid_{lg.id}")
             f2 = charts.residual_rose(lg.view if len(lg.view) else lg.fix)
             if f2:
-                b.plotly_chart(f2, width='stretch')
+                b.plotly_chart(f2, width='stretch', key=f"rose_{lg.id}")
 
         _, wverdict, wdetail = derive.wind_sign_evidence(
             lg.view if len(lg.view) else lg.fix, hdg_alive, awa_alive)
@@ -524,7 +636,7 @@ with tab_compass:
 
         hist = charts.speed_histogram(lg.view if len(lg.view) else lg.fix, min_speed)
         if hist:
-            st.plotly_chart(hist, width='stretch')
+            st.plotly_chart(hist, width='stretch', key=f"speed_{lg.id}")
         st.divider()
 
     with st.expander("Why clockwise is the default", expanded=False):
@@ -580,6 +692,8 @@ with tab_data:
 | `cog` | course over ground, `NaN` unless the boat actually moved |
 | `resid` | `hdg − cog`, the compass error against travel direction |
 | `awa` | apparent wind angle, 0 = head-to-wind, increasing to starboard |
+| `mode` | control mode the autopilot was in — `MANUAL`, `AUTO`, … — blank on logs older than the nav columns |
+| `auto_mode` | which autonomous behaviour was running; only meaningful in `AUTO` |
 | `speed` | metres per second over the centred speed window |
 | `moving` | speed cleared the jitter threshold |
 | `outlier` | rejected as a physically implausible jump |

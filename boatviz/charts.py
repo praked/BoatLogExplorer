@@ -5,7 +5,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from .schema import CHANNELS_BY_KEY
+from .schema import CHANNELS_BY_KEY, POWER_CHANNELS
 
 # The app follows the browser's light/dark preference, so chart chrome uses
 # translucent greys that read correctly on either background. Font colour is
@@ -119,18 +119,7 @@ def timeseries(logs, keys, height_per=150):
                                            hovertemplate="%{y:.1f}<extra></extra>"),
                               row=row, col=1)
             else:
-                td, ym, lo, hi = _envelope(t, y)
-                if lo is not None:
-                    fig.add_trace(go.Scattergl(
-                        x=np.concatenate([td, td[::-1]]),
-                        y=np.concatenate([hi, lo[::-1]]),
-                        fill="toself", mode="none",
-                        fillcolor=_rgba(color, 0.18), hoverinfo="skip",
-                        showlegend=False), row=row, col=1)
-                fig.add_trace(go.Scattergl(x=td, y=ym, mode="lines", name=lg.id,
-                                           line=dict(color=color, width=1.4),
-                                           hovertemplate="%{y:.3g}<extra></extra>"),
-                              row=row, col=1)
+                _add_band_line(fig, row, t, y, color, lg.id)
 
         if ch is not None:
             fig.update_yaxes(title_text=ch.unit, row=row, col=1)
@@ -142,10 +131,78 @@ def timeseries(logs, keys, height_per=150):
     return _layout(fig, height_per * len(keys))
 
 
+def _add_band_line(fig, row, t, y, color, name, *, hovertemplate="%{y:.3g}<extra></extra>",
+                   width=1.4, dash=None, showlegend=True):
+    """Mean line over a min/max band, so a decimated series still shows spikes."""
+    td, ym, lo, hi = _envelope(t, y)
+    if lo is not None:
+        fig.add_trace(go.Scattergl(
+            x=np.concatenate([td, td[::-1]]),
+            y=np.concatenate([hi, lo[::-1]]),
+            fill="toself", mode="none",
+            fillcolor=_rgba(color, 0.18), hoverinfo="skip",
+            showlegend=False), row=row, col=1)
+    fig.add_trace(go.Scattergl(x=td, y=ym, mode="lines", name=name,
+                               line=dict(color=color, width=width, dash=dash),
+                               showlegend=showlegend,
+                               hovertemplate=hovertemplate), row=row, col=1)
+
+
 def _rgba(hex_color, alpha):
     h = hex_color.lstrip("#")
     r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
     return f"rgba({r},{g},{b},{alpha})"
+
+
+POWER_COLORS = {"ch1": "#3d8fd6", "ch2": "#eb6834", "ch3": "#1baf7a"}
+TOTAL_COLOR = "#9457c9"
+# _rgba parses hex, so a fallback has to be hex too, not one of the rgba greys.
+OTHER_CHANNEL_COLOR = "#898781"
+
+
+def power_timeseries(log, channels=POWER_CHANNELS, height=430):
+    """Watts and amps per monitor channel, with the three-channel total.
+
+    Drawn from raw rows rather than fixes: draw changes continuously while the
+    GPS is still repeating one position, so the deduplicated frame would sample
+    the load at whatever instant the receiver happened to update.
+    """
+    df = log.df_view if hasattr(log, "df_view") else log.df
+    live = [ch for ch in channels
+            if ch.power in df.columns and df[ch.power].notna().any()]
+    if not live or len(df) < 2:
+        return None
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.09,
+                        subplot_titles=["Power", "Current"])
+    t = _times(df["t"])
+    total = np.zeros(len(df))
+
+    for ch in live:
+        color = POWER_COLORS.get(ch.key, OTHER_CHANNEL_COLOR)
+        w = df[ch.power].to_numpy(dtype=float)
+        total += np.nan_to_num(w)
+        _add_band_line(fig, 1, t, w, color, ch.label,
+                       hovertemplate="%{y:.2f} W<extra>" + ch.label + "</extra>")
+        if ch.current in df.columns:
+            _add_band_line(fig, 2, t, df[ch.current].to_numpy(dtype=float), color,
+                           ch.label, showlegend=False,
+                           hovertemplate="%{y:.3f} A<extra>" + ch.label + "</extra>")
+
+    if len(live) > 1:
+        _add_band_line(fig, 1, t, total, TOTAL_COLOR, "Total", dash="dot",
+                       hovertemplate="%{y:.2f} W<extra>total</extra>")
+
+    fig.update_yaxes(title_text="W", row=1, col=1)
+    fig.update_yaxes(title_text="A", row=2, col=1)
+    for ann in fig.layout.annotations:
+        ann.font.size = 12
+
+    fig = _layout(fig, height)
+    fig.update_layout(showlegend=True,
+                      legend=dict(orientation="h", yanchor="bottom", y=1.04,
+                                  xanchor="left", x=0))
+    return fig
 
 
 def residual_timeseries(fix, log_id=""):
