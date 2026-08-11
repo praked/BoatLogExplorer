@@ -5,7 +5,8 @@ import json
 import numpy as np
 import pandas as pd
 
-POINT_FIELDS = ["row", "hdg", "cog", "resid", "awa", "speed", "dwell", "source"]
+POINT_FIELDS = ["row", "hdg", "cog", "resid", "awa", "speed", "dwell", "source",
+                "mode", "auto_mode"]
 
 
 def _clean(v):

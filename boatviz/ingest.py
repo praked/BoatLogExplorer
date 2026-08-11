@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from .geo import haversine_m
-from .schema import detect_columns
+from .schema import CATEGORY_COLUMNS, POWER_COLUMNS, detect_columns
 
 # Latitude and longitude must stay float64. At 47 deg N a float32 mantissa
 # quantizes position to ~0.6 m, which silently merges genuinely distinct GPS
@@ -20,7 +20,7 @@ from .schema import detect_columns
 GPS_COLUMNS = ["gps_lat", "gps_lon"]
 SCALAR_COLUMNS = ["awa_deg", "heading", "rotation_vector", "geomag_rotation_vector",
                   "gyro_z_dps", "sys_temp_c", "sys_volts_v"]
-NUMERIC_COLUMNS = GPS_COLUMNS + SCALAR_COLUMNS
+NUMERIC_COLUMNS = GPS_COLUMNS + SCALAR_COLUMNS + POWER_COLUMNS
 
 STATUS_OK = "ok"
 STATUS_EMPTY = "empty"
@@ -132,15 +132,18 @@ def load_log(source, log_id: str | None = None, size: int | None = None) -> Log:
         df[name] = (pd.to_numeric(raw[src], errors="coerce").astype(dtype)
                     if src is not None else np.array(np.nan, dtype=dtype))
 
-    # Deliberately category rather than the nullable "string" dtype: this frame
-    # gets pickled by Streamlit's cache, and StringDtype does not survive that
-    # round-trip on older pandas builds (notably the one bundled with Pyodide,
-    # which raises NotImplementedError on unpickling). heading_source holds only
-    # a handful of distinct values, so category is also far smaller.
-    src = cols.get("heading_source")
-    values = (raw[src].astype(object).where(raw[src].notna(), "")
-              if src is not None else pd.Series("", index=raw.index))
-    df["heading_source"] = pd.Series(values.to_numpy(), index=df.index).astype("category")
+    # Deliberately category rather than the nullable "string" dtype: these
+    # frames get pickled by Streamlit's cache, and StringDtype does not survive
+    # that round-trip on older pandas builds (notably the one bundled with
+    # Pyodide, which raises NotImplementedError on unpickling). Each of these
+    # holds only a handful of distinct values, so category is also far smaller.
+    # A missing column becomes an empty string rather than being skipped, so
+    # every consumer sees the same frame shape whichever firmware wrote the log.
+    for name in CATEGORY_COLUMNS:
+        src = cols.get(name)
+        values = (raw[src].astype(object).where(raw[src].notna(), "")
+                  if src is not None else pd.Series("", index=raw.index))
+        df[name] = pd.Series(values.to_numpy(), index=df.index).astype("category")
 
     df = df[df["t"].notna()].reset_index(drop=True)
     if df.empty:
@@ -180,10 +183,12 @@ def _build_fixes(df: pd.DataFrame) -> pd.DataFrame:
     """
     valid = _valid_gps_mask(df)
     g = df.loc[valid, ["row", "t", "gps_lat", "gps_lon", "heading", "awa_deg",
-                       "geomag_rotation_vector", "gyro_z_dps", "heading_source"]]
+                       "geomag_rotation_vector", "gyro_z_dps", "heading_source",
+                       "mode", "auto_mode"]]
     if g.empty:
         return pd.DataFrame(columns=["row", "t", "lat", "lon", "hdg", "awa",
-                                     "geomag", "gyro", "source", "dwell"])
+                                     "geomag", "gyro", "source", "mode",
+                                     "auto_mode", "dwell"])
 
     changed = (g["gps_lat"] != g["gps_lat"].shift()) | (g["gps_lon"] != g["gps_lon"].shift())
     fix = g[changed].copy()

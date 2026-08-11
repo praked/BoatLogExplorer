@@ -4,6 +4,10 @@ The canonical schema written by boatv1/utils/data_logger.py is:
 
     ts_iso, gps_lat, gps_lon, gps_ts, awa_deg, heading, rotation_vector,
     geomag_rotation_vector, gyro_z_dps, heading_source, sys_temp_c, sys_volts_v
+
+A later revision of that logger widened the row with an INA3221 power monitor
+(ch1..ch3) and the autopilot's own state (mode, auto_mode, and the waypoint
+fields). Those columns are optional everywhere: logs from either revision load.
 """
 
 from dataclasses import dataclass
@@ -12,6 +16,8 @@ CANONICAL_COLUMNS = [
     "ts_iso", "gps_lat", "gps_lon", "gps_ts", "awa_deg", "heading",
     "rotation_vector", "geomag_rotation_vector", "gyro_z_dps",
     "heading_source", "sys_temp_c", "sys_volts_v",
+    "mode", "auto_mode",
+    "ch1_pwr", "ch1_cur", "ch2_pwr", "ch2_cur", "ch3_pwr", "ch3_cur",
 ]
 
 
@@ -48,6 +54,54 @@ CHANNELS = [
 
 CHANNELS_BY_KEY = {c.key: c for c in CHANNELS}
 HEADING_KEYS = ["heading", "geomag_rotation_vector", "rotation_vector"]
+
+
+# ------------------------------------------------------------------ power rail
+
+@dataclass(frozen=True)
+class PowerChannel:
+    key: str
+    label: str
+    power: str      # column holding bus power, watts
+    current: str    # column holding current, amps
+
+
+# The firmware logs ChannelReading.power_w and .current_a straight from
+# sensors/ina3221_sensor.py, so these really are watts and amps -- no scaling.
+# What each channel feeds is a wiring decision the firmware does not record, so
+# they stay numbered rather than being given invented names. Bus voltage is not
+# logged, but power / current recovers it: the driver computes power as
+# bus_voltage_v * current_a.
+POWER_CHANNELS = [
+    PowerChannel("ch1", "Channel 1", "ch1_pwr", "ch1_cur"),
+    PowerChannel("ch2", "Channel 2", "ch2_pwr", "ch2_cur"),
+    PowerChannel("ch3", "Channel 3", "ch3_pwr", "ch3_cur"),
+]
+
+POWER_COLUMNS = [c for ch in POWER_CHANNELS for c in (ch.power, ch.current)]
+
+
+# --------------------------------------------------------------- control modes
+
+# Names as boatv1/utils/modes.py writes them through mode_name(). An unlisted
+# value still plots -- it just falls through to the "other" colour rather than
+# being dropped, which is what makes a firmware change visible instead of silent.
+MODE_LABELS = {
+    "MANUAL": "RC sticks drive the actuators",
+    "SIM_STEERED": "rudder/sail follow des_heading from MOOS",
+    "HYBRID": "rudder from RC, sail automatic by wind",
+    "AUTO": "autonomous: station-keeping, point-to-point or rendezvous",
+    "RESET": "surfaces centred, motor stopped",
+}
+
+# boat/main.py AutoModes -- only meaningful while mode is AUTO.
+AUTO_MODE_LABELS = {
+    "SK": "station-keeping",
+    "AutoP2P": "auto point-to-point",
+    "RDV": "rendezvous",
+}
+
+CATEGORY_COLUMNS = ["heading_source", "mode", "auto_mode"]
 
 
 def detect_columns(columns) -> dict:

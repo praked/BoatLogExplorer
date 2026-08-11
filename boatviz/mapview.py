@@ -6,6 +6,8 @@ explicit max_native_zoom/max_zoom control and a token-free imagery source --
 both of which Leaflet gives directly and pydeck does not.
 """
 
+import html
+
 import branca.colormap as cm
 import folium
 import numpy as np
@@ -14,6 +16,7 @@ from folium.plugins import Fullscreen, MeasureControl, MousePosition
 
 from .derive import wind_direction
 from .geo import offset_latlon, wrap360
+from .schema import AUTO_MODE_LABELS
 
 # Native tiles stop at 19; allowing zoom to 22 upscales them instead of going
 # blank, which is what lets a 90 m track fill the viewport.
@@ -45,6 +48,22 @@ ARROW_COLORS = {
     "wind_to": "#c07fe0",
 }
 
+# Control mode is categorical, so it gets fixed colours rather than a ramp:
+# MANUAL and AUTO must stay distinguishable at a glance, which is the whole
+# point of colouring by it. Keyed by the names boatv1/utils/modes.py writes.
+MODE_COLORS = {
+    "MANUAL": "#2a78d6",
+    "SIM_STEERED": "#0f9bb5",
+    "HYBRID": "#c99a1e",
+    "AUTO": "#1baf7a",
+    "RESET": "#d03b3b",
+    "": "#898781",          # column absent, or the row predates nav logging
+}
+
+# A mode the firmware gained after this app was written still draws, in a colour
+# no listed mode uses, so it shows up as new rather than passing for grey.
+UNKNOWN_MODE_COLOR = "#9457c9"
+
 
 def build_map(logs, *, basemap="Satellite (Esri)", color_by="log",
               show_track=True, show_points=True, point_budget=3000,
@@ -58,6 +77,7 @@ def build_map(logs, *, basemap="Satellite (Esri)", color_by="log",
         return m
 
     scale = _color_scale(tracks, color_by)
+    modes_drawn = set()
 
     for i, lg in enumerate(tracks):
         base = LOG_COLORS[i % len(LOG_COLORS)]
@@ -66,6 +86,8 @@ def build_map(logs, *, basemap="Satellite (Esri)", color_by="log",
             view = view[view["moving"]]
         if view.empty:
             continue
+        if color_by == "mode":
+            modes_drawn.update(_mode_values(view).tolist())
 
         group = folium.FeatureGroup(name=f"{lg.id}", show=True)
 
@@ -82,6 +104,8 @@ def build_map(logs, *, basemap="Satellite (Esri)", color_by="log",
         _add_cursor(m, cursor, convention, wind_sign)
     if scale is not None:
         scale.add_to(m)
+    if color_by == "mode":
+        _add_mode_legend(m, modes_drawn)
 
     folium.LayerControl(collapsed=False).add_to(m)
     return m
@@ -125,8 +149,12 @@ CYCLIC_STEPS = ["#d94a4a", "#d98a2b", "#c9c02e", "#5fb84a", "#2eb5a5",
 
 
 def _color_scale(tracks, color_by):
-    """Return a branca colormap for continuous variables, or None."""
-    if color_by in ("log", "heading_source", "none"):
+    """Return a branca colormap for continuous variables, or None.
+
+    Categorical variables get their own discrete legend instead -- a continuous
+    ramp over mode names would imply an ordering the values do not have.
+    """
+    if color_by in ("log", "heading_source", "mode", "none"):
         return None
 
     col = {"time": "t", "speed": "speed", "heading": "hdg", "awa": "awa"}.get(color_by)
@@ -159,13 +187,51 @@ def _values_for(view, color_by):
     return view.get({"speed": "speed", "heading": "hdg", "awa": "awa"}.get(color_by))
 
 
+def mode_color(value):
+    return MODE_COLORS.get(str(value), UNKNOWN_MODE_COLOR)
+
+
+def _mode_values(view):
+    """Control mode per row as plain strings, "" where it was never logged."""
+    if "mode" not in view.columns:
+        return np.array([""] * len(view), dtype=object)
+    col = view["mode"]
+    return col.astype(object).where(col.notna(), "").astype(str).to_numpy()
+
+
 def _point_colors(view, color_by, base, scale):
+    if color_by == "mode":
+        return [mode_color(v) for v in _mode_values(view)]
     if scale is None or color_by in ("log", "none"):
         return [base] * len(view)
     vals = _values_for(view, color_by)
     if vals is None:
         return [base] * len(view)
     return [base if not np.isfinite(v) else scale(v) for v in np.asarray(vals, dtype=float)]
+
+
+def _add_mode_legend(m, modes):
+    """Discrete swatch legend, in place of the colormap bar a ramp would add."""
+    if not modes:
+        return
+    known = [k for k in MODE_COLORS if k in modes]
+    ordered = known + sorted(v for v in modes if v not in MODE_COLORS)
+
+    rows = "".join(
+        "<div style='display:flex;align-items:center;gap:6px;margin:2px 0'>"
+        f"<span style='width:12px;height:12px;border-radius:2px;flex:none;"
+        f"background:{mode_color(v)}'></span>"
+        f"<span>{html.escape(v) if v else 'not recorded'}</span></div>"
+        for v in ordered)
+
+    # Fixed light card rather than theme-aware colours: this sits on top of a
+    # satellite or dark basemap, neither of which follows the app's theme.
+    m.get_root().html.add_child(folium.Element(
+        "<div style='position:fixed;bottom:26px;right:12px;z-index:9999;"
+        "background:rgba(255,255,255,0.92);color:#1a1a1a;font:12px system-ui;"
+        "padding:8px 10px;border:1px solid rgba(0,0,0,0.25);border-radius:4px'>"
+        "<div style='font-weight:600;margin-bottom:4px'>Control mode</div>"
+        f"{rows}</div>"))
 
 
 # ---------------------------------------------------------------- layers
@@ -179,32 +245,61 @@ def _add_track(group, view, color_by, base, scale):
     if len(coords) < 2:
         return
 
-    if scale is None or color_by in ("log", "none"):
+    codes, color_of, tips = _track_classes(view, color_by, scale)
+    if codes is None:
         folium.PolyLine(coords.tolist(), color=base, weight=2.5, opacity=0.85,
                         tooltip="track").add_to(group)
         return
 
-    # Quantise the colour variable so the track becomes a handful of polylines
-    # rather than one per segment.
-    vals = np.asarray(_values_for(view, color_by), dtype=float)
+    start = 0
+    for i in range(1, len(codes) + 1):
+        if i == len(codes) or codes[i] != codes[start]:
+            # Runs share their boundary vertex, so consecutive stretches join up
+            # instead of leaving a one-segment hole between them -- and a run of
+            # a single sample, such as a brief RESET, still draws.
+            stop = min(i + 1, len(coords))
+            if codes[start] >= 0 and stop - start >= 2:
+                folium.PolyLine(coords[start:stop].tolist(),
+                                color=color_of(codes[start]), weight=2.5,
+                                opacity=0.9, tooltip=tips(codes[start])).add_to(group)
+            start = i
+
+
+def _track_classes(view, color_by, scale):
+    """Per-vertex class code, plus colour and tooltip for a code.
+
+    Returns (None, None, None) when the track should be drawn in one flat
+    colour. Continuous variables are quantised so the track becomes a handful of
+    polylines rather than one per segment; categorical ones use their own values.
+    """
+    if color_by == "mode":
+        values = _mode_values(view)
+        index = {v: i for i, v in enumerate(dict.fromkeys(values))}
+        names = {i: v for v, i in index.items()}
+        codes = np.array([index[v] for v in values], dtype=int)
+        return (codes,
+                lambda c: mode_color(names[c]),
+                lambda c: f"mode {names[c] or 'not recorded'}")
+
+    if scale is None or color_by in ("log", "none"):
+        return None, None, None
+
+    vals = _values_for(view, color_by)
+    if vals is None:
+        return None, None, None
+
+    vals = np.asarray(vals, dtype=float)
     finite = np.isfinite(vals)
     if not finite.any():
-        folium.PolyLine(coords.tolist(), color=base, weight=2.5, opacity=0.85).add_to(group)
-        return
+        return None, None, None
 
     lo, hi = np.nanmin(vals[finite]), np.nanmax(vals[finite])
     span = (hi - lo) or 1.0
-    bins = np.clip(((vals - lo) / span * 11).astype(int), 0, 11)
-    bins[~finite] = -1
-
-    start = 0
-    for i in range(1, len(coords) + 1):
-        if i == len(coords) or bins[i] != bins[start]:
-            if i - start >= 2 and bins[start] >= 0:
-                mid = lo + (bins[start] + 0.5) / 12 * span
-                folium.PolyLine(coords[start:i].tolist(), color=scale(mid),
-                                weight=2.5, opacity=0.9).add_to(group)
-            start = i
+    # Non-finite entries are cast from a stand-in rather than from NaN, which
+    # has no defined integer value, then marked -1 so they are skipped.
+    codes = np.clip(((np.where(finite, vals, lo) - lo) / span * 11).astype(int), 0, 11)
+    codes[~finite] = -1
+    return codes, lambda c: scale(lo + (c + 0.5) / 12 * span), lambda c: color_by
 
 
 # Above this many points, per-marker popups dominate the generated HTML (each
@@ -233,8 +328,30 @@ def _fmt(v, unit="", digits=1, dash="--"):
     return f"{v:.{digits}f}{unit}"
 
 
+def _cell(r, name):
+    """A row's value as a string, empty for missing or NaN.
+
+    `or ""` alone will not do it: NaN is truthy, so a missing cell would render
+    as the literal text "nan".
+    """
+    v = r.get(name)
+    return "" if v is None or pd.isna(v) else str(v)
+
+
+def _mode_text(r):
+    """Control mode, qualified by the AUTO sub-mode when there is one."""
+    mode = _cell(r, "mode")
+    if not mode:
+        return ""
+    auto = _cell(r, "auto_mode")
+    return f"{mode} · {AUTO_MODE_LABELS.get(auto, auto)}" if auto else mode
+
+
 def _tooltip(r):
     parts = [f"row {int(r['row'])}", pd.Timestamp(r["t"]).strftime("%H:%M:%S")]
+    mode = _mode_text(r)
+    if mode:
+        parts.append(mode)
     if np.isfinite(r.get("hdg", np.nan)):
         parts.append(f"hdg {_fmt(r['hdg'], '°', 0)}")
     if np.isfinite(r.get("speed", np.nan)):
@@ -253,6 +370,7 @@ def _popup_html(r, log_id):
         f"{pd.Timestamp(r['t']).strftime('%Y-%m-%d %H:%M:%S')} UTC</span>"
         f"<table style='margin-top:6px;border-spacing:6px 2px'>"
         + row("lat, lon", f"{r['lat']:.6f}, {r['lon']:.6f}")
+        + row("mode", html.escape(_mode_text(r)) or "--")
         + row("heading", _fmt(r.get("hdg"), "&deg;"))
         + row("course", _fmt(r.get("cog"), "&deg;"))
         + row("hdg - cog", _fmt(r.get("resid"), "&deg;"))

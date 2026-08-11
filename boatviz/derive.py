@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .geo import ang_diff, bearing_deg, circ_mean_R, haversine_m, wrap180, wrap360
+from .schema import POWER_CHANNELS
 
 DEFAULT_SPEED_WINDOW_S = 5.0
 DEFAULT_D_MIN_M = 3.0
@@ -258,3 +259,72 @@ def wind_sign_evidence(fix, heading_alive=True, awa_alive=True):
             f"{better} produces a markedly steadier wind direction "
             f"(R={max(plus, minus):.3f} vs {min(plus, minus):.3f}).")
     return out, verdict, detail
+
+
+# ----------------------------------------------------------------------- power
+
+# Power runs on raw rows, not on deduplicated fixes: consumption is a property
+# of the electrical system and keeps changing while the GPS repeats a fix.
+
+# Longer than this between rows means the logger stopped, not that the load held
+# steady, so the energy integral drops the gap rather than charging the whole
+# interval to the last sample. Rows land ~9 Hz apart, so this is generous.
+MAX_POWER_GAP_S = 5.0
+
+# The shunt reads a few milliamps of noise with nothing connected. Below this a
+# channel is treated as unloaded, which keeps implied bus voltage -- power over
+# current -- from being computed by dividing noise by noise.
+CURRENT_NOISE_A = 0.005
+
+
+def power_summary(df, channels=POWER_CHANNELS):
+    """Per-channel consumption over the rows handed in.
+
+    One dict per channel, always all of them and in order, so a channel that is
+    wired but idle stays visible instead of vanishing from the table. `present`
+    distinguishes "logged nothing" from "logged zero" -- the first means this
+    firmware or run had no monitor, the second means nothing drew current.
+    """
+    out = []
+    ts = _epoch_seconds(df["t"]) if len(df) else np.zeros(0)
+
+    for ch in channels:
+        row = {"key": ch.key, "label": ch.label, "n": 0, "present": False,
+               "mean_w": np.nan, "peak_w": np.nan, "energy_wh": 0.0,
+               "mean_a": np.nan, "peak_a": np.nan, "bus_v": np.nan}
+
+        w = _column(df, ch.power)
+        a = _column(df, ch.current)
+        finite = np.isfinite(w)
+        row["n"] = int(finite.sum())
+        row["present"] = bool(row["n"])
+
+        if row["present"]:
+            row["mean_w"] = float(np.nanmean(w))
+            row["peak_w"] = float(np.nanmax(w))
+            row["energy_wh"] = _energy_wh(ts, w)
+        if np.isfinite(a).any():
+            row["mean_a"] = float(np.nanmean(a))
+            row["peak_a"] = float(np.nanmax(a))
+            # power = bus_voltage * current in the driver, so the division
+            # recovers a voltage the logger never wrote down.
+            loaded = np.isfinite(w) & (a > CURRENT_NOISE_A)
+            if loaded.any():
+                row["bus_v"] = float(np.median(w[loaded] / a[loaded]))
+
+        out.append(row)
+    return out
+
+
+def _column(df, name):
+    if name not in df.columns:
+        return np.full(len(df), np.nan)
+    return df[name].to_numpy(dtype=float)
+
+
+def _energy_wh(ts, w):
+    """Trapezoidal integral of watts over seconds, in watt-hours."""
+    if len(w) < 2:
+        return 0.0
+    dt = np.clip(np.diff(ts), 0.0, MAX_POWER_GAP_S)
+    return float(np.nansum((w[:-1] + w[1:]) / 2.0 * dt) / 3600.0)
