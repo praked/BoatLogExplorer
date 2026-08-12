@@ -69,10 +69,12 @@ def build_map(logs, *, basemap="Satellite (Esri)", color_by="log",
               show_track=True, show_points=True, point_budget=3000,
               arrows=(), arrow_budget=150, arrow_len_m=6.0,
               convention="CW (clockwise, N=0 E=90)", wind_sign=1.0,
-              moving_only=False, cursor=None):
+              moving_only=False, cursor=None, markers=(), fit_markers=False):
     """Assemble the Folium map for the currently selected logs and filters."""
     tracks = [lg for lg in logs if lg.has_track and len(lg.view) >= 1]
-    m = _base_map(tracks, basemap)
+    m = _base_map(tracks, basemap,
+                  [(mk.lat, mk.lon) for mk in markers] if fit_markers else ())
+    _add_markers(m, markers)
     if not tracks:
         return m
 
@@ -111,7 +113,7 @@ def build_map(logs, *, basemap="Satellite (Esri)", color_by="log",
     return m
 
 
-def _base_map(tracks, basemap):
+def _base_map(tracks, basemap, extra_points=()):
     cfg = BASEMAPS.get(basemap, BASEMAPS["Satellite (Esri)"])
     m = folium.Map(location=[47.695, 9.194], zoom_start=17, tiles=None,
                    prefer_canvas=True, control_scale=True)
@@ -126,16 +128,23 @@ def _base_map(tracks, basemap):
     MeasureControl(position="topleft", primary_length_unit="meters",
                    primary_area_unit="sqmeters").add_to(m)
 
-    bounds = _bounds(tracks)
+    bounds = _bounds(tracks, extra_points)
     if bounds:
         m.fit_bounds(bounds, padding=(24, 24))
     return m
 
 
-def _bounds(tracks):
+def _bounds(tracks, extra_points=()):
+    """Extent of the tracks, optionally widened to take in loose points.
+
+    Markers are only included on request. A mistyped coordinate would otherwise
+    pull the view out to sea and shrink a 90 m track to a dot, with nothing on
+    screen to explain why.
+    """
     pts = [(lg.view["lat"].min(), lg.view["lon"].min(),
             lg.view["lat"].max(), lg.view["lon"].max())
            for lg in tracks if len(lg.view)]
+    pts += [(lat, lon, lat, lon) for lat, lon in extra_points]
     if not pts:
         return None
     a = np.array(pts)
@@ -232,6 +241,67 @@ def _add_mode_legend(m, modes):
         "padding:8px 10px;border:1px solid rgba(0,0,0,0.25);border-radius:4px'>"
         "<div style='font-weight:600;margin-bottom:4px'>Control mode</div>"
         f"{rows}</div>"))
+
+
+# ---------------------------------------------------------------- markers
+
+# Symbols are inline SVG in a DivIcon rather than Leaflet's image pins or
+# AwesomeMarkers: no extra CDN fetch, exact control of colour, and the shape
+# scales cleanly when the imagery is zoomed past its native tile level.
+MARKER_BOX = 18          # px; the symbol is centred on the coordinate
+MARKER_SHAPES = {
+    "circle": "<circle cx='9' cy='9' r='6'/>",
+    "square": "<rect x='3.5' y='3.5' width='11' height='11' rx='1'/>",
+    "diamond": "<path d='M9 2.5 L15.5 9 L9 15.5 L2.5 9 Z'/>",
+    "triangle": "<path d='M9 2.5 L15.5 15 L2.5 15 Z'/>",
+    "cross": "<path d='M4 4 L14 14 M14 4 L4 14' fill='none' stroke-width='3.4'/>",
+    "pin": "<path d='M9 16.5 C9 16.5 3 10.6 3 7 A6 6 0 1 1 15 7 C15 10.6 9 16.5 9 16.5 Z'/>",
+}
+
+
+def _add_markers(m, markers):
+    """User-placed reference points, in their own toggleable layer."""
+    if not markers:
+        return
+    group = folium.FeatureGroup(name="Markers", show=True)
+    for mk in markers:
+        folium.Marker(
+            [mk.lat, mk.lon],
+            icon=folium.DivIcon(
+                icon_size=(MARKER_BOX, MARKER_BOX),
+                icon_anchor=(MARKER_BOX // 2, MARKER_BOX // 2),
+                # Leaflet's own .leaflet-div-icon paints a white box and a grey
+                # border behind whatever it holds, so the class is replaced
+                # rather than extended.
+                class_name="boat-marker",
+                html=_marker_icon_html(mk)),
+            tooltip=(f"{html.escape(mk.name)} &middot; {mk.type}<br>"
+                     f"{mk.lat:.6f}, {mk.lon:.6f}"),
+        ).add_to(group)
+    group.add_to(m)
+
+
+def _marker_icon_html(mk):
+    shape = MARKER_SHAPES.get(mk.style.shape, MARKER_SHAPES["circle"])
+    # The white stroke is what keeps every colour legible against satellite
+    # imagery, which is dark in water and bright on a wake.
+    symbol = (f"<svg width='{MARKER_BOX}' height='{MARKER_BOX}' "
+              f"viewBox='0 0 {MARKER_BOX} {MARKER_BOX}' "
+              f"fill='{mk.style.color}' stroke='#ffffff' stroke-width='1.6' "
+              f"stroke-linejoin='round'>{shape}</svg>")
+
+    # The label hangs outside the icon box, so the wrapper must not clip it. The
+    # label also ignores the pointer: it can be wide, and swallowing clicks that
+    # far from the symbol would block the map under it. The symbol itself stays
+    # hoverable, which is what shows the tooltip.
+    return (
+        f"<div style='position:relative;width:{MARKER_BOX}px;"
+        f"height:{MARKER_BOX}px;overflow:visible'>{symbol}"
+        f"<span style='position:absolute;left:{MARKER_BOX + 3}px;top:1px;"
+        f"white-space:nowrap;pointer-events:none;font:600 11px/1.35 system-ui;"
+        f"padding:0 5px;border-radius:3px;background:rgba(255,255,255,0.92);"
+        f"color:#1a1a1a;border:1px solid rgba(0,0,0,0.25)'>"
+        f"{html.escape(mk.name)}</span></div>")
 
 
 # ---------------------------------------------------------------- layers

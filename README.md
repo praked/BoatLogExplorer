@@ -83,6 +83,35 @@ the boat sitting still.
 The slider step adapts to the log length, giving roughly 500 stops across the
 range (15 seconds on a two-hour log), so short sections can be picked precisely.
 
+## Markers
+
+A track passing 4 m from a buoy and one passing 40 m from it look identical
+without something to measure against, so the **Markers** panel under the map
+takes named positions and draws them on the chart. It is a small spreadsheet —
+paste rows straight in from Excel or Sheets:
+
+| column | meaning |
+|---|---|
+| `name` | whatever you will recognise on the map: `wp1`, `buoy`, `rock` |
+| `lat`, `lon` | WGS84 decimal degrees |
+| `type` | sets the symbol and its colour |
+
+Types are `Waypoint` (blue diamond), `Buoy` (orange circle), `Hazard` (red
+cross), `Start` (green triangle), `Finish` (purple square) and `Note` (grey pin).
+
+Under the sheet, **closest approach** reports how near the boat actually got to
+each marker, when, and in which log — measured against the selected time window,
+so it follows the range slider rather than the whole recording.
+
+Markers live in the browser session and are lost on reload, so **Download
+markers** writes a `markers.csv` and the uploader reads one back. That file is
+plain text with the four columns above in any order; column names are matched
+loosely (`latitude`, `lng`, `label` all work) and types are case-insensitive.
+
+The map fits itself to the track, not to the markers, so one mistyped coordinate
+cannot shrink a 90 m track to a dot. Tick **Zoom map to include markers** when
+you do want the view widened to reach them.
+
 ## Conventions
 
 **Heading is a normal clockwise compass bearing** — N=0, E=90, S=180, W=270 — and
@@ -121,6 +150,7 @@ boatviz/
   ingest.py         CSV parsing, GPS validation, fix deduplication
   qa.py             alive / frozen / constant detection per channel
   derive.py         speed, course over ground, residuals, convention scoring
+  markers.py        user-placed map markers: validation, CSV, closest approach
   geo.py            circular statistics and geodesy
   mapview.py        Folium map construction
   charts.py         Plotly figures

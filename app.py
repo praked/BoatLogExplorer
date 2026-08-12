@@ -6,6 +6,7 @@ Run with:  streamlit run app.py
 import io
 from datetime import timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -13,6 +14,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from boatviz import charts, derive, export, mapview
+from boatviz import markers as markers_mod
 from boatviz.ingest import (STATUS_EMPTY, STATUS_ERROR, STATUS_FRAGMENT,
                             STATUS_NO_GPS, STATUS_OK, discover_logs, load_log)
 from boatviz.qa import ABSENT, ALIVE, CONSTANT, FROZEN, PARTIAL, assess
@@ -190,6 +192,117 @@ def _recorded(frame, col):
 def _has_power(log):
     return any(ch.power in log.df.columns and log.df[ch.power].notna().any()
                for ch in POWER_CHANNELS)
+
+
+MARKER_BASE = "marker_rows"     # sheet the editor starts from, not its edits
+MARKER_EPOCH = "marker_epoch"   # bumped to retire the editor's pending edits
+MARKER_UPLOAD = "marker_upload"
+
+
+def _replace_markers(frame):
+    """Swap the sheet the editor works from.
+
+    st.data_editor's keyed state holds edits as row deltas against the frame it
+    was given, so a new frame has to arrive with a new widget key -- otherwise
+    edits made to the old sheet are replayed onto whatever now sits in those row
+    positions. Bumping the epoch is what retires them.
+    """
+    st.session_state[MARKER_BASE] = frame
+    st.session_state[MARKER_EPOCH] = st.session_state.get(MARKER_EPOCH, 0) + 1
+
+
+class Placed(NamedTuple):
+    markers: list
+    fit: bool
+
+
+def marker_panel(logs_) -> Placed:
+    """Sheet of named map markers, plus what the boat did near them.
+
+    Returns this run's valid markers, so the caller can hand them to the map.
+    """
+    st.session_state.setdefault(MARKER_BASE, markers_mod.empty_frame())
+
+    with st.expander("Markers", expanded=False):
+        st.caption(
+            "Name a position and it appears on the map: waypoints, a buoy, a "
+            "rock worth avoiding. Paste straight from a spreadsheet, or drop in "
+            "a CSV with `name, lat, lon, type` columns.")
+
+        # Both of these replace the sheet, so both must run before the editor.
+        io_col, clear_col = st.columns([3, 1])
+        upload = io_col.file_uploader("Load markers CSV", type="csv",
+                                      key="marker_csv", label_visibility="collapsed")
+        # Never disabled. The button is drawn before the editor, so any count it
+        # could test is a render behind -- it would grey out on the first paint
+        # of a full sheet and stay lit on the paint after a clear. Clearing an
+        # empty sheet costs nothing.
+        if clear_col.button("Clear all", width="stretch"):
+            _replace_markers(markers_mod.empty_frame())
+
+        if upload is not None:
+            # Applied once. Without the guard every rerun re-imports the file
+            # and overwrites edits made since, because the uploader keeps
+            # handing the same file back.
+            data = upload.getvalue()
+            signature = (upload.name, len(data))
+            if st.session_state.get(MARKER_UPLOAD) != signature:
+                st.session_state[MARKER_UPLOAD] = signature
+                loaded, problems = markers_mod.parse_csv(data)
+                if len(loaded):
+                    _replace_markers(loaded)
+                for note in problems:
+                    st.warning(note)
+
+        edited = st.data_editor(
+            st.session_state[MARKER_BASE], num_rows="dynamic",
+            width="stretch", hide_index=True,
+            key=f"marker_editor_{st.session_state.get(MARKER_EPOCH, 0)}",
+            column_config={
+                "name": st.column_config.TextColumn(
+                    "Name", help="wp1, buoy, start — whatever you will "
+                                 "recognise on the map"),
+                "lat": st.column_config.NumberColumn(
+                    "Latitude", format="%.6f", min_value=-90.0, max_value=90.0),
+                "lon": st.column_config.NumberColumn(
+                    "Longitude", format="%.6f", min_value=-180.0, max_value=180.0),
+                "type": st.column_config.SelectboxColumn(
+                    "Type", options=list(markers_mod.MARKER_TYPES),
+                    default=markers_mod.DEFAULT_TYPE,
+                    help="Sets the symbol and its colour on the map"),
+            })
+
+        placed, problems = markers_mod.valid_rows(edited)
+        for note in problems:
+            st.warning(note)
+
+        if not placed:
+            return Placed([], False)
+
+        legend = " · ".join(
+            f"{t.label}" for t in markers_mod.MARKER_TYPES.values()
+            if t.label in {mk.type for mk in placed})
+        st.caption(f"**{len(placed)} on the map** — {legend}")
+
+        fit_col, dl_col = st.columns([3, 1])
+        fit = fit_col.checkbox(
+            "Zoom map to include markers", False,
+            help="Off by default: one mistyped coordinate would otherwise pull "
+                 "the view out to sea and shrink the track to a dot.")
+        dl_col.download_button("Download markers", markers_mod.to_csv(placed),
+                               "markers.csv", "text/csv", width="stretch")
+
+        approach = markers_mod.closest_approach(placed, logs_)
+        if len(approach):
+            st.dataframe(
+                approach.style.format({"Closest approach (m)": "{:,.1f}"},
+                                      na_rep="no fixes"),
+                width="stretch", hide_index=True, key="marker_approach")
+            st.caption("Closest the boat came to each marker **within the "
+                       "selected time window**, so it follows the time range "
+                       "above rather than the whole recording.")
+
+    return Placed(placed, fit)
 
 
 def apply_time_filter(logs_, t0, t1):
@@ -445,32 +558,42 @@ with tab_map:
             help="AWA is logged 0–360 increasing to starboard.") == "heading + AWA" else -1.0
 
     with view:
-        cursor = None
-        m = mapview.build_map(
-            selected, basemap=basemap, color_by=color_by,
-            show_track=show_track, show_points=show_points,
-            point_budget=point_budget, arrows=arrows,
-            arrow_budget=arrow_budget, arrow_len_m=arrow_len,
-            convention=convention, wind_sign=wind_sign,
-            moving_only=moving_only, cursor=cursor)
-        # Rendered as plain HTML rather than via streamlit-folium: none of that
-        # component's click-return values are used here, and dropping it keeps
-        # the app to packages that also run in a browser-hosted build.
-        components.html(m.get_root().render(), height=680, scrolling=False)
+        # The marker sheet belongs under the map, but the map cannot be drawn
+        # until the sheet has been read. Same slot trick as the time presets:
+        # this container reserves the display position while execution runs on.
+        map_slot = st.container()
+        placed = marker_panel(selected)
 
-        if color_by == "mode":
-            present = sorted({v for lg in selected
-                              for v in lg.view.get("mode", pd.Series(dtype=str))
-                                              .astype(str).unique() if v})
-            st.caption(" · ".join(
-                f"**{name}** — {MODE_LABELS[name]}" if name in MODE_LABELS
-                else f"**{name}** — not a mode this app knows; check "
-                     "`utils/modes.py` in the firmware"
-                for name in present) or "No control mode recorded in this window.")
+        with map_slot:
+            cursor = None
+            m = mapview.build_map(
+                selected, basemap=basemap, color_by=color_by,
+                show_track=show_track, show_points=show_points,
+                point_budget=point_budget, arrows=arrows,
+                arrow_budget=arrow_budget, arrow_len_m=arrow_len,
+                convention=convention, wind_sign=wind_sign,
+                moving_only=moving_only, cursor=cursor,
+                markers=placed.markers, fit_markers=placed.fit)
+            # Rendered as plain HTML rather than via streamlit-folium: none of
+            # that component's click-return values are used here, and dropping
+            # it keeps the app to packages that also run in a browser build.
+            components.html(m.get_root().render(), height=680, scrolling=False)
 
-        if moving_only and n_moving == 0:
-            st.info("No fixes in this window exceed the moving threshold, so the "
-                    "map is empty. Lower the threshold or widen the time window.")
+            if color_by == "mode":
+                present = sorted({v for lg in selected
+                                  for v in lg.view.get("mode", pd.Series(dtype=str))
+                                                  .astype(str).unique() if v})
+                st.caption(" · ".join(
+                    f"**{name}** — {MODE_LABELS[name]}" if name in MODE_LABELS
+                    else f"**{name}** — not a mode this app knows; check "
+                         "`utils/modes.py` in the firmware"
+                    for name in present)
+                    or "No control mode recorded in this window.")
+
+            if moving_only and n_moving == 0:
+                st.info("No fixes in this window exceed the moving threshold, so "
+                        "the map is empty. Lower the threshold or widen the "
+                        "time window.")
 
 
 with tab_series:
