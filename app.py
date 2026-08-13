@@ -226,8 +226,9 @@ def marker_panel(logs_) -> Placed:
     with st.expander("Markers", expanded=False):
         st.caption(
             "Name a position and it appears on the map: waypoints, a buoy, a "
-            "rock worth avoiding. Paste straight from a spreadsheet, or drop in "
-            "a CSV with `name, lat, lon, type` columns.")
+            "rock worth avoiding. Each gets a dashed ring at its radius. Paste "
+            "straight from a spreadsheet, or drop in a CSV with "
+            "`name, lat, lon, type, wp_radius` columns.")
 
         # Both of these replace the sheet, so both must run before the editor.
         io_col, clear_col = st.columns([3, 1])
@@ -270,6 +271,13 @@ def marker_panel(logs_) -> Placed:
                     "Type", options=list(markers_mod.MARKER_TYPES),
                     default=markers_mod.DEFAULT_TYPE,
                     help="Sets the symbol and its colour on the map"),
+                "wp_radius": st.column_config.NumberColumn(
+                    "Radius (m)", format="%.0f", min_value=0.0, step=1.0,
+                    default=markers_mod.DEFAULT_RADIUS_M,
+                    help=f"Dashed ring drawn around the marker. "
+                         f"{markers_mod.DEFAULT_RADIUS_M:g} m matches the "
+                         f"firmware's point_to_point_tolerance_m, the distance "
+                         f"at which a waypoint counts as reached. 0 hides it."),
             })
 
         placed, problems = markers_mod.valid_rows(edited)
@@ -295,12 +303,14 @@ def marker_panel(logs_) -> Placed:
         approach = markers_mod.closest_approach(placed, logs_)
         if len(approach):
             st.dataframe(
-                approach.style.format({"Closest approach (m)": "{:,.1f}"},
+                approach.style.format({"Closest approach (m)": "{:,.1f}",
+                                       "Radius (m)": "{:,.0f}"},
                                       na_rep="no fixes"),
                 width="stretch", hide_index=True, key="marker_approach")
             st.caption("Closest the boat came to each marker **within the "
                        "selected time window**, so it follows the time range "
-                       "above rather than the whole recording.")
+                       "above rather than the whole recording. *Inside radius* "
+                       "is that distance against the dashed ring.")
 
     return Placed(placed, fit)
 

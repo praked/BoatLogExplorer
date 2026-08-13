@@ -265,6 +265,17 @@ def _add_markers(m, markers):
         return
     group = folium.FeatureGroup(name="Markers", show=True)
     for mk in markers:
+        # Ring first, so the symbol and its label draw over it. Dashed and
+        # barely filled: it marks a tolerance, and must not hide the track
+        # passing through it, which is the thing being judged.
+        if mk.wp_radius > 0:
+            folium.Circle(
+                [mk.lat, mk.lon], radius=mk.wp_radius,
+                color=mk.style.color, weight=1.5, opacity=0.9,
+                dash_array="5 5", fill=True, fill_opacity=0.06,
+                tooltip=f"{html.escape(mk.name)} &middot; "
+                        f"{mk.wp_radius:g} m radius").add_to(group)
+
         folium.Marker(
             [mk.lat, mk.lon],
             icon=folium.DivIcon(

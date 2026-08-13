@@ -39,12 +39,17 @@ MARKER_TYPES = {t.label: t for t in (
 
 DEFAULT_TYPE = "Waypoint"
 
+# Matches point_to_point_tolerance_m in every boat_config_*.json, so the ring
+# drawn here is the same circle the autopilot retires a waypoint inside. Station
+# keeping uses 25 m, which is why this is per-marker rather than one setting.
+DEFAULT_RADIUS_M = 10.0
+
 # Types are matched case-insensitively and stored canonically: a file written by
 # hand or by another tool says "buoy", and silently demoting that to a waypoint
 # would lose information the user did supply.
 TYPE_LOOKUP = {label.lower(): label for label in MARKER_TYPES}
 
-COLUMNS = ["name", "lat", "lon", "type"]
+COLUMNS = ["name", "lat", "lon", "type", "wp_radius"]
 
 # Spreadsheets and chartplotters disagree about what the coordinate columns are
 # called, and the file is meant to be editable outside this app.
@@ -53,6 +58,7 @@ COLUMN_ALIASES = {
     "lat": ("lat", "latitude"),
     "lon": ("lon", "longitude", "lng", "long"),
     "type": ("type", "kind", "symbol"),
+    "wp_radius": ("wp_radius", "radius", "wp_radius_m", "radius_m", "tolerance_m"),
 }
 
 
@@ -62,6 +68,7 @@ class Marker:
     lat: float
     lon: float
     type: str = DEFAULT_TYPE
+    wp_radius: float = DEFAULT_RADIUS_M
 
     @property
     def style(self) -> MarkerType:
@@ -74,7 +81,8 @@ def empty_frame() -> pd.DataFrame:
     return pd.DataFrame({"name": pd.Series(dtype="object"),
                          "lat": pd.Series(dtype="float64"),
                          "lon": pd.Series(dtype="float64"),
-                         "type": pd.Series(dtype="object")})
+                         "type": pd.Series(dtype="object"),
+                         "wp_radius": pd.Series(dtype="float64")})
 
 
 def valid_rows(frame):
@@ -106,7 +114,17 @@ def valid_rows(frame):
                             f"position on Earth.")
             continue
 
-        markers.append(Marker(name, lat, lon, _type(r.get("type"))))
+        # A blank radius means "the usual one", not "no ring" -- zero is how you
+        # ask for no ring, and a negative number is a mistake worth naming.
+        radius = _number(r.get("wp_radius"))
+        if radius is None:
+            radius = DEFAULT_RADIUS_M
+        elif radius < 0:
+            problems.append(f"Row {n} (**{name}**): a radius cannot be "
+                            f"negative. Using {DEFAULT_RADIUS_M:g} m.")
+            radius = DEFAULT_RADIUS_M
+
+        markers.append(Marker(name, lat, lon, _type(r.get("type")), radius))
     return markers, problems
 
 
@@ -137,6 +155,10 @@ def parse_csv(data) -> tuple[pd.DataFrame, list[str]]:
     frame["name"] = raw[found["name"]].astype(object)
     frame["lat"] = pd.to_numeric(raw[found["lat"]], errors="coerce")
     frame["lon"] = pd.to_numeric(raw[found["lon"]], errors="coerce")
+    frame["wp_radius"] = (
+        pd.to_numeric(raw[found["wp_radius"]], errors="coerce")
+        .fillna(DEFAULT_RADIUS_M) if found["wp_radius"] is not None
+        else DEFAULT_RADIUS_M)
 
     problems = []
     if found["type"] is None:
@@ -154,8 +176,8 @@ def parse_csv(data) -> tuple[pd.DataFrame, list[str]]:
 
 
 def to_csv(markers) -> bytes:
-    frame = pd.DataFrame([(m.name, m.lat, m.lon, m.type) for m in markers],
-                         columns=COLUMNS)
+    frame = pd.DataFrame([(m.name, m.lat, m.lon, m.type, m.wp_radius)
+                          for m in markers], columns=COLUMNS)
     return frame.to_csv(index=False).encode()
 
 
@@ -182,6 +204,10 @@ def closest_approach(markers, logs) -> pd.DataFrame:
             "Marker": mk.name,
             "Type": mk.type,
             "Closest approach (m)": best[0] if best else np.nan,
+            "Radius (m)": mk.wp_radius,
+            # The ring is an arrival test, so the table says whether it passed.
+            "Inside radius": ("–" if not best or mk.wp_radius <= 0
+                              else "yes" if best[0] <= mk.wp_radius else "no"),
             "When (UTC)": pd.Timestamp(best[1]).strftime("%b %d %H:%M:%S") if best else "–",
             "Log": best[2].replace("boat_log_", "") if best else "–",
         })

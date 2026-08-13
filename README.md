@@ -95,18 +95,28 @@ paste rows straight in from Excel or Sheets:
 | `name` | whatever you will recognise on the map: `wp1`, `buoy`, `rock` |
 | `lat`, `lon` | WGS84 decimal degrees |
 | `type` | sets the symbol and its colour |
+| `wp_radius` | radius of the dashed ring around it, metres; `0` hides the ring |
 
 Types are `Waypoint` (blue diamond), `Buoy` (orange circle), `Hazard` (red
 cross), `Start` (green triangle), `Finish` (purple square) and `Note` (grey pin).
 
+`wp_radius` defaults to **10 m**, which is `point_to_point_tolerance_m` in every
+`boat_config_*.json` — the distance at which the firmware retires a waypoint. So
+the ring on the map is the same circle the autopilot was steering to. Station
+keeping uses 25 m, which is why the radius is per marker rather than one setting
+for the whole sheet.
+
 Under the sheet, **closest approach** reports how near the boat actually got to
 each marker, when, and in which log — measured against the selected time window,
-so it follows the range slider rather than the whole recording.
+so it follows the range slider rather than the whole recording. *Inside radius*
+is that distance tested against the ring: whether the boat ever counted as
+having arrived.
 
 Markers live in the browser session and are lost on reload, so **Download
 markers** writes a `markers.csv` and the uploader reads one back. That file is
-plain text with the four columns above in any order; column names are matched
-loosely (`latitude`, `lng`, `label` all work) and types are case-insensitive.
+plain text with the five columns above in any order; column names are matched
+loosely (`latitude`, `lng`, `label`, `tolerance_m` all work), types are
+case-insensitive, and a missing or blank radius becomes the 10 m default.
 
 The map fits itself to the track, not to the markers, so one mistyped coordinate
 cannot shrink a 90 m track to a dot. Tick **Zoom map to include markers** when
