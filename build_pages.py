@@ -25,8 +25,12 @@ STLITE = "1.8.1"
 # component and cannot work here, which is why the app renders its map as HTML.
 REQUIREMENTS = ["plotly", "folium", "branca"]
 
+# as_posix(), not str(): these become filenames inside stlite's virtual
+# filesystem, and on Windows str() yields "boatviz\charts.py" -- one file whose
+# name contains a backslash rather than a module inside a package. The page then
+# boots as far as `import boatviz` and dies with ModuleNotFoundError.
 APP_FILES = ["app.py"] + sorted(
-    str(p.relative_to(ROOT)) for p in (ROOT / "boatviz").glob("*.py"))
+    p.relative_to(ROOT).as_posix() for p in (ROOT / "boatviz").glob("*.py"))
 
 PAGE = """<!doctype html>
 <html lang="en">
