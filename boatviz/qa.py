@@ -40,6 +40,7 @@ class ChannelReport:
     alive_windows: list = field(default_factory=list)   # [(start, end)] merged live spans
 
     circular: bool = False
+    freeze_checked: bool = True
 
     @property
     def summary(self) -> str:
@@ -47,6 +48,10 @@ class ChannelReport:
             return "no data"
         if self.verdict == CONSTANT:
             return f"constant @ {self.const_value:g}{self.unit}"
+        if not self.freeze_checked:
+            # A commanded or computed value; "live x% of the log" would be
+            # measuring the autopilot's activity, not a sensor's health.
+            return f"logged {self.present_frac * 100:.0f}%, range {self.vmin:.3g}–{self.vmax:.3g}{self.unit}"
         if self.verdict == FROZEN:
             # For a circular channel the min/max range is misleading (a value
             # wobbling across 0 spans 0-360), so report the spread instead.
@@ -79,7 +84,8 @@ def assess_channel(df: pd.DataFrame, ch) -> ChannelReport:
     s = df[ch.key]
     present = float(s.notna().mean()) if len(s) else 0.0
     rep = ChannelReport(ch.key, ch.label, ch.unit, ABSENT,
-                        present_frac=present, circular=ch.circular)
+                        present_frac=present, circular=ch.circular,
+                        freeze_checked=ch.freeze_check)
 
     if present < PRESENT_MIN:
         return rep
@@ -90,6 +96,13 @@ def assess_channel(df: pd.DataFrame, ch) -> ChannelReport:
     if vals.nunique() == 1:
         rep.verdict = CONSTANT
         rep.const_value = float(vals.iloc[0])
+        return rep
+
+    if not ch.freeze_check:
+        # It is varying and it is present; there is nothing further to ask of a
+        # value the boat computed itself. Skipping the resample below also keeps
+        # the per-window Python loop off two thirds of the channel list.
+        rep.verdict = ALIVE
         return rep
 
     spread_fn = circ_spread_deg if ch.circular else _linear_spread

@@ -30,11 +30,17 @@ publishes to `https://<user>.github.io/BoatLogExplorer/`. That is a *project*
 page on a subpath; it does not affect a `<user>.github.io` user page, which is a
 separate repository.
 
-Two things to know about the browser build: the first visit downloads roughly
-30 MB of Python runtime and takes about 35 seconds before the app appears
-(cached afterwards), and everything is parsed in browser memory, so the big
-multi-gigabyte-scale logs are better handled by running locally. The two sample
-logs load automatically.
+Three things to know about the browser build. The first visit downloads roughly
+30 MB of Python runtime and takes about 35 seconds before the app appears (cached
+afterwards). Everything is parsed in browser memory, so the big
+multi-gigabyte-scale logs are better handled by running locally. And **Chrome
+discards the tab if you leave it idle**: its Memory Saver reclaims background
+tabs, and because the discard fires no `pagehide` or `unload` event, nothing can
+be saved first — coming back reloads the page and pays the whole start-up again,
+with the loaded logs and time window gone. Add the page to the allow-list at
+`chrome://settings/performance`, or pin the tab, and it stays alive.
+
+The two sample logs load automatically.
 
 **Streamlit Community Cloud** is the better home if you want full speed and the
 ability to open the 64 MB recordings. Point <https://share.streamlit.io> at this
@@ -135,12 +141,28 @@ compass is frozen or the boat never moved.
 **All headings are magnetic.** No declination correction exists anywhere in the
 firmware. At Lake Constance that is roughly +3°, small next to the residual error.
 
-**Wind is `heading + AWA`**, where AWA is 0 at head-to-wind and increases to
-starboard, and already includes the vane's +15° mount offset. The evidence for the
-sign is weak, so wind overlays are off by default and both toggles are exposed.
+**Apparent wind is `heading + AWA`**, where AWA is 0 at head-to-wind and increases
+to starboard. The evidence for the sign is weak, so the derived wind overlays are
+off by default and both toggles are exposed.
 
-**True wind is not computed.** It needs apparent wind *speed*, which this firmware
-never logs. Any number labelled "true wind direction" here would be invented.
+**True wind now comes from the boat, not from this app.** Logs written before the
+2026-08 firmware carry no apparent wind *speed*, so true wind cannot be computed
+from them and any number labelled "true wind" would have been invented — which is
+why this app never derived one. The 2026-08 firmware logs `wind_spd` and computes
+`twd_deg`, `twa_deg` and `tws_mps` itself, in the control path, so those are read
+straight from the file and shown on the **Sailing** tab. They are ground-referenced
+(the boat has no water-referenced log), so in a current they are biased by exactly
+the current vector.
+
+**`err_deg` is `brg − hdg`, not `des_hdg − hdg`.** It is measured against the
+bearing to the waypoint rather than the heading the controller asked for, so it is
+large by design while beating: the boat is deliberately not pointing at the mark.
+Read it next to the beating lane before calling it bad steering.
+
+**Cross-track error is positive to the right** of the line from the previous
+waypoint to the active one, and **`tack` is +1 on the port tack** (wind from
+starboard, TWA > 0), −1 on starboard. Both conventions are the firmware's, from
+`sail_func/guidance.py`.
 
 **`sys_temp_c` and `sys_volts_v` are Raspberry Pi health readings** — CPU die
 temperature and core voltage from `vcgencmd`. They are not water temperature and
@@ -159,7 +181,8 @@ boatviz/
   schema.py         channel metadata, column detection
   ingest.py         CSV parsing, GPS validation, fix deduplication
   qa.py             alive / frozen / constant detection per channel
-  derive.py         speed, course over ground, residuals, convention scoring
+  derive.py         speed, course over ground, residuals, convention scoring,
+                    sail and navigation summaries
   markers.py        user-placed map markers: validation, CSV, closest approach
   geo.py            circular statistics and geodesy
   mapview.py        Folium map construction

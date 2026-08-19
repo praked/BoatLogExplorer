@@ -12,15 +12,35 @@ import numpy as np
 import pandas as pd
 
 from .geo import haversine_m
-from .schema import CATEGORY_COLUMNS, POWER_COLUMNS, detect_columns
+from .schema import (BOOL_COLUMNS, CATEGORY_COLUMNS, CHANNELS, DISCRETE_NUMERIC,
+                     POWER_COLUMNS, detect_columns)
 
 # Latitude and longitude must stay float64. At 47 deg N a float32 mantissa
 # quantizes position to ~0.6 m, which silently merges genuinely distinct GPS
 # fixes during deduplication.
 GPS_COLUMNS = ["gps_lat", "gps_lon"]
-SCALAR_COLUMNS = ["awa_deg", "heading", "rotation_vector", "geomag_rotation_vector",
-                  "gyro_z_dps", "sys_temp_c", "sys_volts_v"]
+SCALAR_COLUMNS = [c.key for c in CHANNELS] + DISCRETE_NUMERIC
 NUMERIC_COLUMNS = GPS_COLUMNS + SCALAR_COLUMNS + POWER_COLUMNS
+
+# Columns carried from the raw rows onto the deduplicated fixes, as
+# (raw name, fix name). Short names on the fix side match the existing
+# hdg/awa convention. Everything downstream of the fix frame -- the map,
+# the GeoJSON export, the Data tab -- sees exactly this list.
+FIX_PROJECTION = [
+    ("gps_lat", "lat"), ("gps_lon", "lon"),
+    ("heading", "hdg"), ("geomag_rotation_vector", "geomag"),
+    ("gyro_z_dps", "gyro"), ("heading_source", "source"),
+    ("mode", "mode"), ("auto_mode", "auto_mode"),
+    ("awa_deg", "awa"), ("wind_spd", "aws"),
+    ("twd_deg", "twd"), ("twa_deg", "twa"), ("tws_mps", "tws"),
+    ("des_hdg_deg", "des_hdg"), ("brg_deg", "brg"), ("err_deg", "err"),
+    ("xte_m", "xte"), ("dist_m", "dist"), ("wp_left", "wp_left"),
+    ("rudder_deg", "rudder"), ("sail_deg", "sail"), ("thr_us", "thr"),
+    ("sail_state", "sail_state"), ("sail_fault", "sail_fault"),
+    ("sail_reason", "sail_reason"), ("propulsion", "propulsion"),
+    ("beating", "beating"), ("motor_assist", "motor_assist"),
+    ("tack", "tack"), ("fix_q", "fix_q"),
+]
 
 STATUS_OK = "ok"
 STATUS_EMPTY = "empty"
@@ -145,6 +165,19 @@ def load_log(source, log_id: str | None = None, size: int | None = None) -> Log:
                   if src is not None else pd.Series("", index=raw.index))
         df[name] = pd.Series(values.to_numpy(), index=df.index).astype("category")
 
+    # The firmware writes these as the text "True"/"False", but a column that
+    # happens to be filled on every row is parsed back as a real bool dtype,
+    # so both forms have to land on the same three category values.
+    for name in BOOL_COLUMNS:
+        src = cols.get(name)
+        if src is not None:
+            values = raw[src].map({True: "True", False: "False",
+                                   "True": "True", "False": "False"})
+            values = values.where(values.notna(), "")
+        else:
+            values = pd.Series("", index=raw.index)
+        df[name] = pd.Series(values.to_numpy(), index=df.index).astype("category")
+
     df = df[df["t"].notna()].reset_index(drop=True)
     if df.empty:
         return Log(lid, path, size, STATUS_ERROR, "no parseable timestamps")
@@ -182,19 +215,14 @@ def _build_fixes(df: pd.DataFrame) -> pd.DataFrame:
     the logger re-reading a stale value. dwell records how long each fix persisted.
     """
     valid = _valid_gps_mask(df)
-    g = df.loc[valid, ["row", "t", "gps_lat", "gps_lon", "heading", "awa_deg",
-                       "geomag_rotation_vector", "gyro_z_dps", "heading_source",
-                       "mode", "auto_mode"]]
+    g = df.loc[valid, ["row", "t"] + [src for src, _ in FIX_PROJECTION]]
     if g.empty:
-        return pd.DataFrame(columns=["row", "t", "lat", "lon", "hdg", "awa",
-                                     "geomag", "gyro", "source", "mode",
-                                     "auto_mode", "dwell"])
+        return pd.DataFrame(columns=["row", "t"]
+                            + [dst for _, dst in FIX_PROJECTION] + ["dwell"])
 
     changed = (g["gps_lat"] != g["gps_lat"].shift()) | (g["gps_lon"] != g["gps_lon"].shift())
     fix = g[changed].copy()
-    fix = fix.rename(columns={"gps_lat": "lat", "gps_lon": "lon", "heading": "hdg",
-                              "awa_deg": "awa", "geomag_rotation_vector": "geomag",
-                              "gyro_z_dps": "gyro", "heading_source": "source"})
+    fix = fix.rename(columns=dict(FIX_PROJECTION))
     fix["lat"] = fix["lat"].astype("float64")
     fix["lon"] = fix["lon"].astype("float64")
 

@@ -6,7 +6,12 @@ import numpy as np
 import pandas as pd
 
 POINT_FIELDS = ["row", "hdg", "cog", "resid", "awa", "speed", "dwell", "source",
-                "mode", "auto_mode"]
+                "mode", "auto_mode",
+                "aws", "twd", "twa", "tws",
+                "des_hdg", "brg", "err", "xte", "dist", "wp_left",
+                "rudder", "sail", "thr", "tack", "fix_q",
+                "sail_state", "sail_fault", "sail_reason", "propulsion",
+                "beating", "motor_assist"]
 
 
 def _clean(v):

@@ -7,6 +7,7 @@ both of which Leaflet gives directly and pydeck does not.
 """
 
 import html
+from dataclasses import dataclass
 
 import branca.colormap as cm
 import folium
@@ -16,7 +17,8 @@ from folium.plugins import Fullscreen, MeasureControl, MousePosition
 
 from .derive import wind_direction
 from .geo import offset_latlon, wrap360
-from .schema import AUTO_MODE_LABELS
+from .schema import (AUTO_MODE_LABELS, PROPULSION_COLORS, SAIL_STATE_COLORS,
+                     TACK_COLORS, TACK_LABELS)
 
 # Native tiles stop at 19; allowing zoom to 22 upscales them instead of going
 # blank, which is what lets a 90 m track fill the viewport.
@@ -46,6 +48,17 @@ ARROW_COLORS = {
     "cog": "#1baf7a",
     "wind_from": "#9457c9",
     "wind_to": "#c07fe0",
+    "twd": "#0f9bb5",
+    "des_hdg": "#c99a1e",
+}
+
+ARROW_LABELS = {
+    "heading": "heading",
+    "cog": "course over ground",
+    "wind_from": "apparent wind, from (derived)",
+    "wind_to": "apparent wind, to (derived)",
+    "twd": "true wind, from (logged)",
+    "des_hdg": "desired heading",
 }
 
 # Control mode is categorical, so it gets fixed colours rather than a ramp:
@@ -60,9 +73,48 @@ MODE_COLORS = {
     "": "#898781",          # column absent, or the row predates nav logging
 }
 
-# A mode the firmware gained after this app was written still draws, in a colour
-# no listed mode uses, so it shows up as new rather than passing for grey.
+# A value the firmware gained after this app was written still draws, in a colour
+# no listed value uses, so it shows up as new rather than passing for grey.
 UNKNOWN_MODE_COLOR = "#9457c9"
+
+
+@dataclass(frozen=True)
+class CategoricalColoring:
+    """A fix column whose values are named states rather than a measurement."""
+    column: str
+    title: str          # legend heading
+    colors: dict        # value -> colour, including "" for "not recorded"
+    labeler: object = None   # optional raw value -> display string
+
+    def text(self, view):
+        """Values as display strings, "" where the column was never logged."""
+        if self.column not in view.columns:
+            return np.array([""] * len(view), dtype=object)
+        col = view[self.column]
+        if self.labeler is not None:
+            return np.array([self.labeler(v) for v in col.to_numpy()], dtype=object)
+        return col.astype(object).where(col.notna(), "").astype(str).to_numpy()
+
+    def color(self, value):
+        return self.colors.get(str(value), UNKNOWN_MODE_COLOR)
+
+
+def _tack_label(v):
+    try:
+        return TACK_LABELS.get(int(np.sign(float(v))), "") if np.isfinite(float(v)) else ""
+    except (TypeError, ValueError):
+        return ""
+
+
+CATEGORICALS = {
+    "mode": CategoricalColoring("mode", "Control mode", MODE_COLORS),
+    "sail_state": CategoricalColoring("sail_state", "Sail state", SAIL_STATE_COLORS),
+    "propulsion": CategoricalColoring("propulsion", "Propulsion", PROPULSION_COLORS),
+    "tack": CategoricalColoring(
+        "tack", "Tack",
+        {v: TACK_COLORS[k] for k, v in TACK_LABELS.items()} | {"": TACK_COLORS[""]},
+        labeler=_tack_label),
+}
 
 
 def build_map(logs, *, basemap="Satellite (Esri)", color_by="log",
@@ -79,7 +131,8 @@ def build_map(logs, *, basemap="Satellite (Esri)", color_by="log",
         return m
 
     scale = _color_scale(tracks, color_by)
-    modes_drawn = set()
+    spec = CATEGORICALS.get(color_by)
+    values_drawn = set()
 
     for i, lg in enumerate(tracks):
         base = LOG_COLORS[i % len(LOG_COLORS)]
@@ -88,8 +141,8 @@ def build_map(logs, *, basemap="Satellite (Esri)", color_by="log",
             view = view[view["moving"]]
         if view.empty:
             continue
-        if color_by == "mode":
-            modes_drawn.update(_mode_values(view).tolist())
+        if spec is not None:
+            values_drawn.update(spec.text(view).tolist())
 
         group = folium.FeatureGroup(name=f"{lg.id}", show=True)
 
@@ -106,8 +159,8 @@ def build_map(logs, *, basemap="Satellite (Esri)", color_by="log",
         _add_cursor(m, cursor, convention, wind_sign)
     if scale is not None:
         scale.add_to(m)
-    if color_by == "mode":
-        _add_mode_legend(m, modes_drawn)
+    if spec is not None:
+        _add_cat_legend(m, spec, values_drawn)
 
     folium.LayerControl(collapsed=False).add_to(m)
     return m
@@ -163,10 +216,10 @@ def _color_scale(tracks, color_by):
     Categorical variables get their own discrete legend instead -- a continuous
     ramp over mode names would imply an ordering the values do not have.
     """
-    if color_by in ("log", "heading_source", "mode", "none"):
+    if color_by in CATEGORICALS or color_by in ("log", "heading_source", "none"):
         return None
 
-    col = {"time": "t", "speed": "speed", "heading": "hdg", "awa": "awa"}.get(color_by)
+    col = COLOR_COLUMNS.get(color_by)
     if col is None:
         return None
 
@@ -185,32 +238,37 @@ def _color_scale(tracks, color_by):
         return cm.LinearColormap(["#cde2fb", "#5ba3e8", "#1d5fa8", "#0d366b"],
                                  vmin=lo, vmax=hi, caption="time (earlier to later)")
 
+    if color_by == "xte":
+        # Cross-track error is signed and its zero is the thing being judged, so
+        # it gets a diverging ramp centred there rather than a one-ended one.
+        # The span is symmetric, or one side of the line would read as worse
+        # than the other purely because the boat spent longer on it.
+        lim = float(np.nanpercentile(np.abs(vals), 98)) or 1.0
+        return cm.LinearColormap(["#1d5fa8", "#a9cdf2", "#f2f0e9", "#f0a58a", "#c0392b"],
+                                 vmin=-lim, vmax=lim,
+                                 caption="cross-track error (m, 0 = on the line)")
+
     hi = float(np.nanpercentile(vals, 98)) or 1.0
+    caption = "true wind speed (m/s)" if color_by == "tws" else "speed (m/s)"
     return cm.LinearColormap(["#e8f2d8", "#9ccb6b", "#3f9a4a", "#0d5c3a"],
-                             vmin=0, vmax=hi, caption="speed (m/s)")
+                             vmin=0, vmax=hi, caption=caption)
+
+
+# Continuous colour-by choices, mapped onto the fix column each one reads.
+COLOR_COLUMNS = {"time": "t", "speed": "speed", "heading": "hdg", "awa": "awa",
+                 "xte": "xte", "tws": "tws"}
 
 
 def _values_for(view, color_by):
     if color_by == "time":
         return view["t"].astype("int64") / 1e9
-    return view.get({"speed": "speed", "heading": "hdg", "awa": "awa"}.get(color_by))
-
-
-def mode_color(value):
-    return MODE_COLORS.get(str(value), UNKNOWN_MODE_COLOR)
-
-
-def _mode_values(view):
-    """Control mode per row as plain strings, "" where it was never logged."""
-    if "mode" not in view.columns:
-        return np.array([""] * len(view), dtype=object)
-    col = view["mode"]
-    return col.astype(object).where(col.notna(), "").astype(str).to_numpy()
+    return view.get(COLOR_COLUMNS.get(color_by))
 
 
 def _point_colors(view, color_by, base, scale):
-    if color_by == "mode":
-        return [mode_color(v) for v in _mode_values(view)]
+    spec = CATEGORICALS.get(color_by)
+    if spec is not None:
+        return [spec.color(v) for v in spec.text(view)]
     if scale is None or color_by in ("log", "none"):
         return [base] * len(view)
     vals = _values_for(view, color_by)
@@ -219,17 +277,17 @@ def _point_colors(view, color_by, base, scale):
     return [base if not np.isfinite(v) else scale(v) for v in np.asarray(vals, dtype=float)]
 
 
-def _add_mode_legend(m, modes):
+def _add_cat_legend(m, spec, values):
     """Discrete swatch legend, in place of the colormap bar a ramp would add."""
-    if not modes:
+    if not values:
         return
-    known = [k for k in MODE_COLORS if k in modes]
-    ordered = known + sorted(v for v in modes if v not in MODE_COLORS)
+    known = [k for k in spec.colors if k in values]
+    ordered = known + sorted(v for v in values if v not in spec.colors)
 
     rows = "".join(
         "<div style='display:flex;align-items:center;gap:6px;margin:2px 0'>"
         f"<span style='width:12px;height:12px;border-radius:2px;flex:none;"
-        f"background:{mode_color(v)}'></span>"
+        f"background:{spec.color(v)}'></span>"
         f"<span>{html.escape(v) if v else 'not recorded'}</span></div>"
         for v in ordered)
 
@@ -239,7 +297,7 @@ def _add_mode_legend(m, modes):
         "<div style='position:fixed;bottom:26px;right:12px;z-index:9999;"
         "background:rgba(255,255,255,0.92);color:#1a1a1a;font:12px system-ui;"
         "padding:8px 10px;border:1px solid rgba(0,0,0,0.25);border-radius:4px'>"
-        "<div style='font-weight:600;margin-bottom:4px'>Control mode</div>"
+        f"<div style='font-weight:600;margin-bottom:4px'>{html.escape(spec.title)}</div>"
         f"{rows}</div>"))
 
 
@@ -353,14 +411,15 @@ def _track_classes(view, color_by, scale):
     colour. Continuous variables are quantised so the track becomes a handful of
     polylines rather than one per segment; categorical ones use their own values.
     """
-    if color_by == "mode":
-        values = _mode_values(view)
+    spec = CATEGORICALS.get(color_by)
+    if spec is not None:
+        values = spec.text(view)
         index = {v: i for i, v in enumerate(dict.fromkeys(values))}
         names = {i: v for v, i in index.items()}
         codes = np.array([index[v] for v in values], dtype=int)
         return (codes,
-                lambda c: mode_color(names[c]),
-                lambda c: f"mode {names[c] or 'not recorded'}")
+                lambda c: spec.color(names[c]),
+                lambda c: f"{spec.title.lower()} {names[c] or 'not recorded'}")
 
     if scale is None or color_by in ("log", "none"):
         return None, None, None
@@ -433,6 +492,9 @@ def _tooltip(r):
     mode = _mode_text(r)
     if mode:
         parts.append(mode)
+    state = _cell(r, "sail_state")
+    if state:
+        parts.append(state)
     if np.isfinite(r.get("hdg", np.nan)):
         parts.append(f"hdg {_fmt(r['hdg'], '°', 0)}")
     if np.isfinite(r.get("speed", np.nan)):
@@ -440,10 +502,43 @@ def _tooltip(r):
     return " · ".join(parts)
 
 
+def _finite(r, name):
+    return np.isfinite(r.get(name, np.nan))
+
+
 def _popup_html(r, log_id):
     def row(label, value):
         shade = " style='color:#898781'" if value == "--" else ""
         return f"<tr><td>{label}</td><td{shade}><b>{value}</b></td></tr>"
+
+    # The fixed rows are the ones every firmware revision can fill. The rest
+    # appear only where the log actually carries them, so a 2026-08 popup gains
+    # the autopilot's own state without an older log growing a column of dashes.
+    extra = ""
+    state = _cell(r, "sail_state")
+    propulsion = _cell(r, "propulsion")
+    if state or propulsion:
+        extra += row("sail", html.escape(" · ".join(x for x in (state, propulsion) if x)))
+    if _finite(r, "twd") or _finite(r, "tws"):
+        extra += row("true wind", f"{_fmt(r.get('twd'), '&deg;', 0)} at "
+                                  f"{_fmt(r.get('tws'), ' m/s', 1)}")
+    if _finite(r, "twa"):
+        extra += row("TWA", _fmt(r.get("twa"), "&deg;", 0))
+    if _finite(r, "des_hdg"):
+        extra += row("desired hdg", _fmt(r.get("des_hdg"), "&deg;", 0))
+    if _finite(r, "xte"):
+        extra += row("cross-track", _fmt(r.get("xte"), " m"))
+    if _finite(r, "dist"):
+        left = r.get("wp_left")
+        suffix = f" ({int(left)} left)" if np.isfinite(left if left is not None else np.nan) else ""
+        extra += row("to waypoint", _fmt(r.get("dist"), " m") + suffix)
+    if _finite(r, "rudder") or _finite(r, "sail"):
+        extra += row("rudder / sail", f"{_fmt(r.get('rudder'), '&deg;', 0)} / "
+                                      f"{_fmt(r.get('sail'), '&deg;', 0)}")
+    reason = _cell(r, "sail_reason")
+    if reason:
+        extra += ("<tr><td colspan='2' style='padding-top:4px;color:#6b6a65'>"
+                  f"{html.escape(reason)}</td></tr>")
 
     return (
         f"<div style='font:12px system-ui'><b>{log_id}</b><br>"
@@ -457,6 +552,7 @@ def _popup_html(r, log_id):
         + row("hdg - cog", _fmt(r.get("resid"), "&deg;"))
         + row("AWA", _fmt(r.get("awa"), "&deg;"))
         + row("speed", _fmt(r.get("speed"), " m/s", 2))
+        + extra
         + "</table></div>")
 
 
@@ -482,7 +578,7 @@ def _add_arrows(group, view, kind, budget, length_m, convention, wind_sign):
     bl_lat, bl_lon = offset_latlon(tip_lat, tip_lon, th + 150.0, length_m * 0.35)
     br_lat, br_lon = offset_latlon(tip_lat, tip_lon, th - 150.0, length_m * 0.35)
 
-    label = kind.replace("_", " ")
+    label = ARROW_LABELS.get(kind, kind.replace("_", " "))
     for i in range(len(sel)):
         folium.PolyLine([[lat[i], lon[i]], [tip_lat[i], tip_lon[i]]],
                         color=color, weight=2.5, opacity=0.9,
@@ -507,6 +603,13 @@ def _arrow_angles(view, kind, convention, wind_sign):
             h = wrap360(360.0 - h)
         w = wind_direction(h, view["awa"].to_numpy(dtype=float), wind_sign)
         return wrap360(w + 180.0) if kind == "wind_to" else w
+    if kind == "twd":
+        # Already a compass direction the boat computed for itself, so it takes
+        # neither the heading convention nor the AWA sign guess -- that is what
+        # makes it worth drawing next to the derived apparent-wind arrow.
+        return view["twd"].to_numpy(dtype=float) if "twd" in view else None
+    if kind == "des_hdg":
+        return view["des_hdg"].to_numpy(dtype=float) if "des_hdg" in view else None
     return None
 
 

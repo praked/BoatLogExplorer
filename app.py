@@ -18,7 +18,8 @@ from boatviz import markers as markers_mod
 from boatviz.ingest import (STATUS_EMPTY, STATUS_ERROR, STATUS_FRAGMENT,
                             STATUS_NO_GPS, STATUS_OK, discover_logs, load_log)
 from boatviz.qa import ABSENT, ALIVE, CONSTANT, FROZEN, PARTIAL, assess
-from boatviz.schema import CHANNELS, MODE_LABELS, POWER_CHANNELS
+from boatviz.schema import (CHANNELS, CHANNELS_BY_KEY, GROUP_LABELS, MODE_LABELS,
+                            POWER_CHANNELS, SAIL_FAULT_LABELS, SAIL_STATE_LABELS)
 
 st.set_page_config(page_title="Boat Log Explorer", page_icon="⛵",
                    layout="wide", initial_sidebar_state="expanded")
@@ -194,6 +195,51 @@ def _has_power(log):
                for ch in POWER_CHANNELS)
 
 
+def _has_any(log, columns):
+    """True when the log carries a value in any of these raw columns."""
+    for col in columns:
+        if col not in log.df.columns:
+            continue
+        s = log.df[col]
+        if isinstance(s.dtype, pd.CategoricalDtype):
+            if (s.astype(str) != "").any():
+                return True
+        elif s.notna().any():
+            return True
+    return False
+
+
+def _has_sailing(log):
+    return _has_any(log, ["sail_state", "propulsion", "twd_deg", "tws_mps", "wind_spd"])
+
+
+def _has_nav(log):
+    return _has_any(log, ["des_hdg_deg", "brg_deg", "xte_m", "dist_m"])
+
+
+def _has_actuators(log):
+    return _has_any(log, ["rudder_deg", "sail_deg", "thr_us"])
+
+
+COLOR_BY_LABELS = {
+    "mode": "control mode",
+    "sail_state": "sail state",
+    "propulsion": "propulsion (sail vs motor)",
+    "tack": "tack",
+    "xte": "cross-track error",
+    "tws": "true wind speed",
+}
+
+ARROW_OPTIONS = [
+    # (label, arrow kind, fix column it needs)
+    ("Heading", "heading", "hdg"),
+    ("Course over ground", "cog", "cog"),
+    ("Apparent wind from (derived)", "wind_from", "awa"),
+    ("True wind from (logged)", "twd", "twd"),
+    ("Desired heading", "des_hdg", "des_hdg"),
+]
+
+
 MARKER_BASE = "marker_rows"     # sheet the editor starts from, not its edits
 MARKER_EPOCH = "marker_epoch"   # bumped to retire the editor's pending edits
 MARKER_UPLOAD = "marker_upload"
@@ -347,6 +393,20 @@ def _fmt_span(seconds):
     return f"{seconds / 3600:.1f} h"
 
 
+# A metric with nothing behind it shows a dash rather than "nan": these columns
+# are only filled while the autopilot is running, so blanks are normal.
+def _fmt_pct(v):
+    return "–" if v is None or not np.isfinite(v) else f"{v * 100:.0f}%"
+
+
+def _fmt_deg(v):
+    return "–" if v is None or not np.isfinite(v) else f"{v:.1f}°"
+
+
+def _fmt_m(v):
+    return "–" if v is None or not np.isfinite(v) else f"{v:.1f} m"
+
+
 def _slider_step(span_s):
     """Roughly 500 stops across the range, snapped to a readable unit.
 
@@ -483,17 +543,34 @@ def qa_card(lg):
         f"<span class='chip' style='background:{verdict_color}1a;color:{verdict_color}'>"
         f"{qa.gps_verdict}</span></div>", unsafe_allow_html=True)
 
-    for ch in CHANNELS:
-        rep = qa.channel(ch.key)
-        if rep is None:
+    # Grouped, and a group nothing in the log recorded collapses to one line.
+    # Otherwise a log from before the 2026-08 firmware grows fourteen identical
+    # "no data" rows and buries the sensors it does carry.
+    for group, label in GROUP_LABELS.items():
+        chans = [ch for ch in CHANNELS if ch.group == group]
+        reps = [(ch, qa.channel(ch.key)) for ch in chans]
+        reps = [(ch, r) for ch, r in reps if r is not None]
+        if not reps:
             continue
-        icon, color = STATUS_STYLE.get(rep.verdict, ("–", "#898781"))
-        dim = "" if rep.verdict in (ALIVE, PARTIAL) else "opacity:.55;"
-        st.markdown(
-            f"<div class='qa-row' style='{dim}'>"
-            f"<span class='name'><span style='color:{color}'>{icon}</span> {ch.label}</span>"
-            f"<span class='val'>{rep.summary}</span></div>",
-            unsafe_allow_html=True)
+
+        if all(r.verdict == ABSENT for _, r in reps):
+            st.markdown(
+                f"<div class='qa-row' style='opacity:.45;'>"
+                f"<span class='name'>{label}</span>"
+                f"<span class='val'>not recorded</span></div>",
+                unsafe_allow_html=True)
+            continue
+
+        for ch, rep in reps:
+            if rep.verdict == ABSENT:
+                continue
+            icon, color = STATUS_STYLE.get(rep.verdict, ("–", "#898781"))
+            dim = "" if rep.verdict in (ALIVE, PARTIAL) else "opacity:.55;"
+            st.markdown(
+                f"<div class='qa-row' style='{dim}'>"
+                f"<span class='name'><span style='color:{color}'>{icon}</span> {ch.label}</span>"
+                f"<span class='val'>{rep.summary}</span></div>",
+                unsafe_allow_html=True)
 
     if qa.n_outliers:
         st.caption(f"{qa.n_outliers} implausible fix(es) rejected (> {v_max:g} m/s).")
@@ -507,8 +584,9 @@ with st.sidebar.expander("Sensor health", expanded=True):
 
 # ----------------------------------------------------------------------- tabs
 
-tab_map, tab_series, tab_power, tab_compass, tab_data = st.tabs(
-    ["Map", "Time series", "Battery", "Compass check", "Data"])
+tab_map, tab_series, tab_sail, tab_nav, tab_power, tab_compass, tab_data = st.tabs(
+    ["Map", "Time series", "Sailing", "Navigation", "Battery",
+     "Compass check", "Data"])
 
 
 with tab_map:
@@ -517,14 +595,19 @@ with tab_map:
     with ctrl:
         basemap = st.selectbox("Basemap", list(mapview.BASEMAPS), index=0)
 
-        # Mode is offered only when a log actually carries it: on older logs the
-        # option would silently colour the whole track one "not recorded" grey.
-        color_choices = ["log", "time", "speed", "heading", "awa"]
-        if any(_recorded(lg.fix, "mode") for lg in selected):
-            color_choices.insert(1, "mode")
+        # Each state option is offered only when a log actually carries it: on
+        # older logs it would silently colour the whole track one "not
+        # recorded" grey.
+        states = [c for c in ("mode", "sail_state", "propulsion")
+                  if any(_recorded(lg.fix, c) for lg in selected)]
+        measures = [c for c in ("tack", "xte", "tws")
+                    if any(c in lg.fix.columns and lg.fix[c].notna().any()
+                           for lg in selected)]
+        color_choices = ["log"] + states + ["time", "speed", "heading", "awa"] + measures
+
         color_by = st.selectbox(
             "Colour by", color_choices, index=0,
-            format_func=lambda c: "control mode" if c == "mode" else c,
+            format_func=lambda c: COLOR_BY_LABELS.get(c, c),
             help="Control mode splits the track by what was steering the boat — "
                  "RC, autonomous, or hybrid." if "mode" in color_choices else None)
         st.divider()
@@ -539,15 +622,24 @@ with tab_map:
         any_hdg = any(lg.qa.is_alive("heading") for lg in selected)
         any_awa = any(lg.qa.is_alive("awa_deg") for lg in selected)
 
+        arrow_help = {
+            "heading": None if any_hdg else "Compass is frozen in every selected log",
+            "wind_from": None if any_awa else "Wind vane is stuck in every selected log",
+            "twd": "The boat's own true-wind estimate, drawn as logged — it takes "
+                   "neither the heading convention nor the wind sign below.",
+            "des_hdg": "Where the autopilot was trying to point.",
+        }
+
         arrows = []
-        if st.checkbox("Heading", any_hdg,
-                       help=None if any_hdg else "Compass is frozen in every selected log"):
-            arrows.append("heading")
-        if st.checkbox("Course over ground", False):
-            arrows.append("cog")
-        if st.checkbox("Wind from", False,
-                       help=None if any_awa else "Wind vane is stuck in every selected log"):
-            arrows.append("wind_from")
+        for label, kind, column in ARROW_OPTIONS:
+            # Offered only where the data exists, so an older log does not get
+            # checkboxes that draw nothing.
+            if not any(column in lg.fix.columns and lg.fix[column].notna().any()
+                       for lg in selected):
+                continue
+            if st.checkbox(label, kind == "heading" and any_hdg,
+                           help=arrow_help.get(kind)):
+                arrows.append(kind)
 
         arrow_budget = st.slider("Arrow count", 0, 600, 150, 25)
         arrow_len = st.slider("Arrow length (m)", 2.0, 30.0, 6.0, 1.0)
@@ -616,12 +708,17 @@ with tab_series:
             frozen_keys.append(ch.key)
 
     st.caption("Channels that are frozen or constant in every selected log are "
-               "off by default. `sys_*` are Raspberry Pi health readings — CPU "
-               "temperature and core voltage — not water, air or battery.")
+               "off by default, as are the autopilot and actuator channels — the "
+               "Sailing and Navigation tabs present those in context. `sys_*` are "
+               "Raspberry Pi health readings — CPU temperature and core voltage — "
+               "not water, air or battery.")
 
-    keys = st.multiselect("Channels", [c.key for c in CHANNELS], default=alive_keys,
-                          format_func=lambda k: next(
-                              (c.label for c in CHANNELS if c.key == k), k))
+    defaults = [k for k in alive_keys if CHANNELS_BY_KEY[k].default_on]
+    keys = st.multiselect(
+        "Channels", [c.key for c in CHANNELS], default=defaults,
+        # Streamlit has no option groups, so the group name rides on the label.
+        format_func=lambda k: f"{GROUP_LABELS.get(CHANNELS_BY_KEY[k].group, '')} · "
+                              f"{CHANNELS_BY_KEY[k].label}" if k in CHANNELS_BY_KEY else k)
 
     if keys:
         fig = charts.timeseries(selected, keys)
@@ -632,14 +729,154 @@ with tab_series:
 
     st.divider()
     for lg in selected:
-        strip = charts.aliveness_strip(lg.qa, lg.t_start, lg.t_end,
-                                       [c.key for c in CHANNELS])
+        # Absent channels are left out rather than drawn as empty lanes: on an
+        # older log that would be fourteen grey stripes and nothing else.
+        present = [c.key for c in CHANNELS
+                   if (lg.qa.channel(c.key) or None) is not None
+                   and lg.qa.channel(c.key).verdict != ABSENT]
+        strip = charts.aliveness_strip(lg.qa, lg.t_start, lg.t_end, present)
         if strip:
             st.caption(f"**{lg.id.replace('boat_log_', '')}**")
             # Streamlit derives a chart's identity from its contents, so two
             # logs that happen to produce identical figures collide. Every
             # chart drawn once per log therefore carries the log id as its key.
             st.plotly_chart(strip, width='stretch', key=f"strip_{lg.id}")
+
+
+with tab_sail:
+    sailing_logs = [lg for lg in selected if _has_sailing(lg)]
+
+    if not sailing_logs:
+        st.info("**No wind or sail-logic columns in these logs.** True wind, "
+                "`sail_state` and the sail reason text arrived with the 2026-08 "
+                "firmware; logs recorded before it have nothing to show here.")
+    else:
+        st.caption(
+            "Wind as the boat measured and computed it, and what the sail logic "
+            "decided as a result. **Apparent** wind is what the vane feels, "
+            "distorted by the boat's own motion; **true** wind is the firmware's "
+            "estimate with that motion removed, and TWD is the direction it "
+            "blows *from*. TWA is signed: positive is wind from starboard, which "
+            "is the port tack.")
+
+        wind_keys = [k for k in ("wind_spd", "tws_mps", "twd_deg", "twa_deg")
+                     if any(k in lg.df.columns and lg.df[k].notna().any()
+                            for lg in sailing_logs)]
+        if wind_keys:
+            fig = charts.timeseries(sailing_logs, wind_keys)
+            if fig:
+                st.plotly_chart(fig, width="stretch", key="wind_series")
+
+        for lg in sailing_logs:
+            st.subheader(lg.id.replace("boat_log_", ""))
+            s = derive.sail_summary(lg.df_view)
+
+            a, b, c, d = st.columns(4)
+            a.metric("Under sail", _fmt_pct(s["frac_sail"]))
+            b.metric("Under motor", _fmt_pct(s["frac_motor"]))
+            c.metric("Beating", _fmt_pct(s["frac_beating"]),
+                     help="Working upwind, steering off the direct bearing to "
+                          "make ground against the wind.")
+            d.metric("Tacks", f"{s['n_tacks']}")
+
+            if s["faults"]:
+                st.warning("**The supervisor reported a fault.** " + "; ".join(
+                    f"`{v}`"
+                    + (f" ({SAIL_FAULT_LABELS[v]})" if v in SAIL_FAULT_LABELS else "")
+                    + f" from {pd.Timestamp(t0).strftime('%H:%M:%S')} to "
+                      f"{pd.Timestamp(t1).strftime('%H:%M:%S')}"
+                    for v, t0, t1 in s["faults"][:6]))
+
+            lanes = charts.sail_state_lanes(lg)
+            if lanes:
+                st.plotly_chart(lanes, width="stretch", key=f"lanes_{lg.id}")
+                st.caption(
+                    "Hover the **Sail state** lane for the logic's own "
+                    "explanation of the heading it chose. A gap means the "
+                    "column was not being written — these are only filled while "
+                    "the autopilot is steering.")
+                if s["states"]:
+                    st.caption(" · ".join(
+                        f"**{name}** — {SAIL_STATE_LABELS[name]}"
+                        if name in SAIL_STATE_LABELS
+                        else f"**{name}** — not a state this app knows; check "
+                             "`sail_logic.py` in the firmware"
+                        for name in s["states"]))
+
+            polar = charts.polar_speed(lg.view)
+            if polar:
+                left, right = st.columns([3, 2])
+                left.plotly_chart(polar, width="stretch", key=f"polar_{lg.id}")
+                right.caption(
+                    "Every fix the boat was moving, placed at the true wind "
+                    "angle it was sailing and the speed it made. The orange line "
+                    "is the median at each angle — this boat's measured polar, "
+                    "for the wind range in this window. An empty wedge around 0° "
+                    "is the no-go zone; an empty wedge at 180° means it never ran "
+                    "dead downwind.")
+            st.divider()
+
+
+with tab_nav:
+    nav_logs = [lg for lg in selected if _has_nav(lg) or _has_actuators(lg)]
+
+    if not nav_logs:
+        st.info("**No autopilot columns in these logs.** The waypoint targets, "
+                "steering error and actuator commands arrived with the 2026-08 "
+                "firmware.")
+    else:
+        st.caption(
+            "What the autopilot was aiming at and how well it held it. Desired "
+            "heading is what it steered for; the bearing to the waypoint is the "
+            "direct line. The two separate whenever the boat is beating, because "
+            "it cannot sail straight at a mark that is upwind.")
+
+        for lg in nav_logs:
+            st.subheader(lg.id.replace("boat_log_", ""))
+            n = derive.nav_summary(lg.df_view)
+
+            if n["present"]:
+                a, b, c, d = st.columns(4)
+                wp = ("–" if not np.isfinite(n["wp_start"])
+                      else f"{n['wp_start']:.0f} → {n['wp_end']:.0f}")
+                a.metric("Waypoints left", wp)
+                b.metric("Mean |bearing error|", _fmt_deg(n["mean_abs_err"]),
+                         help="`err_deg` is bearing − heading, not desired − "
+                              "heading, so this is large by design whenever the "
+                              "boat is beating: it is deliberately not pointing "
+                              "at the mark. Read it against the beating lane on "
+                              "the Sailing tab before calling it bad steering.")
+                c.metric("RMS cross-track", _fmt_m(n["rms_xte"]),
+                         help=f"Worst {_fmt_m(n['max_abs_xte'])} off the line.")
+                d.metric("Distance to waypoint at end", _fmt_m(n["dist_end"]))
+
+                fig = charts.navigation_timeseries(lg)
+                if fig:
+                    st.plotly_chart(fig, width="stretch", key=f"nav_{lg.id}")
+                    st.caption(
+                        "Bearing error jumps to ±180° whenever the bearing "
+                        "crosses north — that is the wrap, not a steering "
+                        "failure. Cross-track error is positive when the boat is "
+                        "right of the line looking from the previous waypoint to "
+                        "the active one, and reaching the corridor edge is what "
+                        "triggers a tack.")
+            else:
+                st.info("The autopilot logged no targets inside this time window "
+                        "— it was not steering.")
+
+            if _has_actuators(lg):
+                st.markdown("**Actuators**")
+                act_keys = [k for k in ("rudder_deg", "sail_deg", "thr_us")
+                            if k in lg.df.columns and lg.df[k].notna().any()]
+                fig = charts.timeseries([lg], act_keys)
+                if fig:
+                    st.plotly_chart(fig, width="stretch", key=f"act_{lg.id}")
+                st.caption(
+                    "Commands the autopilot sent, not measured positions — there "
+                    "is no feedback sensor on either surface. Throttle is a servo "
+                    "pulse width where 1500 µs is neutral, and it is only logged "
+                    "outside AUTO.")
+            st.divider()
 
 
 with tab_power:
@@ -830,4 +1067,30 @@ with tab_data:
 | `speed` | metres per second over the centred speed window |
 | `moving` | speed cleared the jitter threshold |
 | `outlier` | rejected as a physically implausible jump |
+
+Columns below arrived with the 2026-08 firmware and are blank on older logs.
+Most are only written while the autopilot is steering.
+
+| column | meaning |
+|---|---|
+| `aws` | apparent wind speed, m/s, as the anemometer reads it |
+| `twd` | true wind direction, degrees clockwise from north — where the wind blows *from* |
+| `twa` | true wind angle relative to the bow, signed: negative is wind on the port side |
+| `tws` | true wind speed, m/s, with the boat's own motion removed |
+| `des_hdg` | heading the controller asked for, against the `hdg` it achieved |
+| `brg` | direct bearing from the boat to the active waypoint |
+| `err` | **`brg − hdg`**, signed — what the rudder is answering. Measured against the bearing, *not* the desired heading, so it is large by design while beating |
+| `xte` | cross-track error in metres from the line between waypoints, **positive to the right** looking from start to finish. Reaching the corridor edge is what triggers a tack |
+| `dist` | metres to the active waypoint |
+| `wp_left` | waypoints still queued; a false arrival shows up as an early drop |
+| `rudder`, `sail` | commanded angles in degrees — commands, not measured positions |
+| `thr` | throttle servo pulse width in µs; 1500 is neutral, only logged outside `AUTO` |
+| `tack` | latched tack side: **+1 is the port tack** (wind from starboard, TWA > 0), −1 starboard |
+| `fix_q` | GPS fix quality from the receiver; 4 is RTK fixed, which a 10 m arrival radius needs |
+| `sail_state` | tack machine: `SAILING`, `INITIATING`, `THROUGH_WIND`, `SETTLING`, `IN_IRONS` |
+| `sail_fault` | supervisor's graded fault, `NOMINAL` when healthy |
+| `sail_reason` | the controller's own sentence explaining what it did this cycle |
+| `propulsion` | `sail` or `motor`, from actual throttle rather than intent |
+| `beating` | the target was inside the no-go zone and is being beaten to |
+| `motor_assist` | the supervisor allowed thrust — a named, time-limited failure |
 """)

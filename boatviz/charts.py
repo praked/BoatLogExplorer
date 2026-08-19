@@ -5,7 +5,8 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from .schema import CHANNELS_BY_KEY, POWER_CHANNELS
+from .schema import (CHANNELS_BY_KEY, POWER_CHANNELS, PROPULSION_COLORS,
+                     SAIL_FAULT_OK, SAIL_STATE_COLORS, TACK_COLORS, TACK_LABELS)
 
 # The app follows the browser's light/dark preference, so chart chrome uses
 # translucent greys that read correctly on either background. Font colour is
@@ -110,7 +111,7 @@ def timeseries(logs, keys, height_per=150):
             y = sub[key].to_numpy(dtype=float)
             color = SERIES[i % len(SERIES)]
 
-            if ch is not None and ch.circular:
+            if ch is not None and (ch.circular or ch.signed_circular):
                 td, yd, _, _ = _envelope(t, y)
                 td, yd = _break_wraps(td, yd)
                 fig.add_trace(go.Scattergl(x=td, y=yd, mode="lines", name=lg.id,
@@ -125,6 +126,15 @@ def timeseries(logs, keys, height_per=150):
             fig.update_yaxes(title_text=ch.unit, row=row, col=1)
             if ch.circular:
                 fig.update_yaxes(range=[0, 360], dtick=90, row=row, col=1)
+            elif ch.signed_circular:
+                fig.update_yaxes(range=[-180, 180], dtick=90, row=row, col=1)
+            if ch.y_range:
+                fig.update_yaxes(range=list(ch.y_range), row=row, col=1)
+            if ch.zero_line:
+                # _layout turns the axis zeroline off, but for a signed quantity
+                # the sign is the reading: which side of the line, which way the
+                # rudder is over.
+                fig.add_hline(y=0, line=dict(color=ZERO, width=1), row=row, col=1)
 
     for ann in fig.layout.annotations:
         ann.font.size = 12
@@ -202,6 +212,257 @@ def power_timeseries(log, channels=POWER_CHANNELS, height=430):
     fig.update_layout(showlegend=True,
                       legend=dict(orientation="h", yanchor="bottom", y=1.04,
                                   xanchor="left", x=0))
+    return fig
+
+
+# ------------------------------------------------------------- sail and nav
+
+BOOL_TRUE_COLORS = {"beating": "#3d8fd6", "motor_assist": "#eb6834",
+                    "sailing": "#1baf7a", "settled": "#9457c9", "tacked": "#d64b8a"}
+BOOL_FALSE_COLOR = "rgba(128,128,128,0.28)"
+FAULT_COLORS = {SAIL_FAULT_OK: "#1baf7a"}
+FAULT_OTHER = "#d03b3b"
+
+
+def _lane_text(df, column):
+    """A column as display strings, "" wherever it was not logged."""
+    if column not in df.columns:
+        return np.array([""] * len(df), dtype=object)
+    col = df[column]
+    if column == "tack":
+        v = col.to_numpy(dtype=float)
+        return np.array([TACK_LABELS.get(int(np.sign(x)), "") if np.isfinite(x) else ""
+                         for x in v], dtype=object)
+    return col.astype(object).where(col.notna(), "").astype(str).to_numpy()
+
+
+def _value_runs(t, values):
+    """Contiguous runs of one value, as (value, start time, end time).
+
+    Blank stretches -- a column the firmware only fills in AUTO -- are left out
+    rather than drawn, so the lane shows a gap where the state was not defined.
+    """
+    values = np.asarray(values, dtype=object)
+    if values.size == 0:
+        return []
+    change = np.flatnonzero(values[1:] != values[:-1]) + 1
+    starts = np.concatenate([[0], change])
+    ends = np.concatenate([change - 1, [values.size - 1]])
+    return [(values[a], t[a], t[b]) for a, b in zip(starts, ends) if values[a] != ""]
+
+
+def _lane_color(column, value):
+    if column == "propulsion":
+        return PROPULSION_COLORS.get(value, OTHER_CHANNEL_COLOR)
+    if column == "sail_state":
+        return SAIL_STATE_COLORS.get(value, OTHER_CHANNEL_COLOR)
+    if column == "sail_fault":
+        return FAULT_COLORS.get(value, FAULT_OTHER)
+    if column == "tack":
+        return {v: TACK_COLORS[k] for k, v in TACK_LABELS.items()}.get(value, OTHER_CHANNEL_COLOR)
+    return BOOL_TRUE_COLORS.get(column, "#3d8fd6") if value == "True" else BOOL_FALSE_COLOR
+
+
+SAIL_LANES = [("propulsion", "Propulsion"), ("sail_state", "Sail state"),
+              ("sail_fault", "Sail fault"), ("tack", "Tack"),
+              ("beating", "Beating"), ("motor_assist", "Motor assist"),
+              ("sailing", "Sailing"), ("settled", "Settled")]
+
+
+def sail_state_lanes(log, height_per=30):
+    """What the sail logic was doing, as one ribbon per state column.
+
+    A stacked time series cannot show this: these are categories, and what
+    matters is when each one held and how they line up against each other.
+    """
+    df = log.df_view if hasattr(log, "df_view") else log.df
+    if df.empty:
+        return None
+
+    lanes = [(col, label) for col, label in SAIL_LANES
+             if col in df.columns and (_lane_text(df, col) != "").any()]
+    if not lanes:
+        return None
+
+    t = _times(df["t"])
+    fig = go.Figure()
+    labels = []
+
+    for i, (column, label) in enumerate(lanes):
+        labels.append(label)
+        runs = _value_runs(t, _lane_text(df, column))
+
+        # One trace per distinct value rather than per run: a beating flag that
+        # flickers produces hundreds of runs, and hundreds of traces is what
+        # makes a Plotly figure slow to serialise and slow to draw.
+        by_value = {}
+        for value, a, b in runs:
+            by_value.setdefault(value, []).append((a, b))
+
+        for value, spans in by_value.items():
+            x, y = [], []
+            for a, b in spans:
+                x += [a, b, np.datetime64("NaT")]
+                y += [i, i, None]
+            fig.add_trace(go.Scatter(
+                x=x, y=y, mode="lines", connectgaps=False,
+                line=dict(color=_lane_color(column, value), width=14),
+                hovertemplate=f"{label}: {value}<extra></extra>"))
+
+    _add_reason_hover(fig, df, t, lanes)
+
+    fig.update_yaxes(tickmode="array", tickvals=list(range(len(lanes))),
+                     ticktext=labels, range=[-0.6, len(lanes) - 0.4], showgrid=False)
+    fig.update_xaxes(range=[t[0], t[-1]])
+    fig = _layout(fig, 60 + height_per * len(lanes), "Sail logic state")
+    # Unified hover would fire all eight lanes at once; each lane is a separate
+    # statement and is read on its own.
+    fig.update_layout(hovermode="closest")
+    return fig
+
+
+def _add_reason_hover(fig, df, t, lanes):
+    """Attach the sail logic's own explanation to the lane it explains.
+
+    sail_reason is free text that changes every second or so -- far too much to
+    draw -- but it is the only place the firmware says *why* it chose a heading,
+    so it rides along as invisible hover points at each change.
+    """
+    if "sail_reason" not in df.columns:
+        return
+    reason = _lane_text(df, "sail_reason")
+    if not (reason != "").any():
+        return
+
+    row = next((i for i, (col, _) in enumerate(lanes) if col == "sail_state"), 0)
+    changed = np.concatenate([[True], reason[1:] != reason[:-1]])
+    keep = changed & (reason != "")
+    fig.add_trace(go.Scatter(
+        x=t[keep], y=np.full(keep.sum(), row), mode="markers",
+        marker=dict(size=16, opacity=0), customdata=reason[keep],
+        hovertemplate="%{customdata}<extra>reason</extra>"))
+
+
+def navigation_timeseries(log, height=640):
+    """The autopilot's own view: where it wants to go and how far off it is."""
+    df = log.df_view if hasattr(log, "df_view") else log.df
+    wanted = ["des_hdg_deg", "brg_deg", "err_deg", "xte_m", "dist_m"]
+    if df.empty or not any(c in df.columns and df[c].notna().any() for c in wanted):
+        return None
+
+    fig = make_subplots(
+        rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.055,
+        subplot_titles=["Heading: actual vs desired vs bearing to waypoint",
+                        "Bearing error (bearing − heading, what the rudder answers)",
+                        "Cross-track error (+ is right of the line)",
+                        "Distance to waypoint"],
+        specs=[[{}], [{}], [{}], [{"secondary_y": True}]])
+
+    t = _times(df["t"])
+
+    for column, name, color, dash in (("heading", "actual", "#3d8fd6", None),
+                                      ("des_hdg_deg", "desired", "#eb6834", "dash"),
+                                      ("brg_deg", "to waypoint", "#9457c9", "dot")):
+        if column not in df.columns or not df[column].notna().any():
+            continue
+        td, yd, _, _ = _envelope(t, df[column].to_numpy(dtype=float))
+        td, yd = _break_wraps(td, yd)
+        fig.add_trace(go.Scattergl(
+            x=td, y=yd, mode="lines", name=name, connectgaps=False,
+            line=dict(color=color, width=1.4, dash=dash),
+            hovertemplate="%{y:.1f}&deg;<extra>" + name + "</extra>"), row=1, col=1)
+
+    if "err_deg" in df.columns:
+        td, yd, _, _ = _envelope(t, df["err_deg"].to_numpy(dtype=float))
+        td, yd = _break_wraps(td, yd)
+        fig.add_trace(go.Scattergl(
+            x=td, y=yd, mode="lines", showlegend=False, connectgaps=False,
+            line=dict(color="#d64b8a", width=1.2),
+            hovertemplate="%{y:.1f}&deg;<extra>bearing error</extra>"), row=2, col=1)
+
+    if "xte_m" in df.columns:
+        _add_band_line(fig, 3, t, df["xte_m"].to_numpy(dtype=float), "#0f9bb5",
+                       "cross-track", showlegend=False,
+                       hovertemplate="%{y:.1f} m<extra>off the line</extra>")
+
+    if "dist_m" in df.columns:
+        _add_band_line(fig, 4, t, df["dist_m"].to_numpy(dtype=float), "#1baf7a",
+                       "distance", showlegend=False,
+                       hovertemplate="%{y:.1f} m<extra>to waypoint</extra>")
+    if "wp_left" in df.columns and df["wp_left"].notna().any():
+        sub = df[["t", "wp_left"]].dropna()
+        fig.add_trace(go.Scatter(
+            x=_times(sub["t"]), y=sub["wp_left"].to_numpy(dtype=float),
+            mode="lines", name="waypoints left", line_shape="hv",
+            line=dict(color=MUTED, width=1.2, dash="dot"),
+            hovertemplate="%{y:.0f} left<extra></extra>"),
+            row=4, col=1, secondary_y=True)
+        fig.update_yaxes(title_text="left", showgrid=False, row=4, col=1,
+                         secondary_y=True)
+
+    fig.update_yaxes(title_text="°", range=[0, 360], dtick=90, row=1, col=1)
+    fig.update_yaxes(title_text="°", range=[-180, 180], dtick=90, row=2, col=1)
+    fig.update_yaxes(title_text="m", row=3, col=1)
+    fig.update_yaxes(title_text="m", row=4, col=1, secondary_y=False)
+    for row in (2, 3):
+        fig.add_hline(y=0, line=dict(color=ZERO, width=1), row=row, col=1)
+    for ann in fig.layout.annotations:
+        ann.font.size = 12
+
+    fig = _layout(fig, height)
+    fig.update_layout(showlegend=True,
+                      legend=dict(orientation="h", yanchor="bottom", y=1.03,
+                                  xanchor="left", x=0))
+    return fig
+
+
+def polar_speed(fix, bins=24, min_points=10):
+    """Boat speed against true wind angle -- the boat's own polar diagram.
+
+    Every angle the boat actually sailed, with the median speed at each,
+    measured rather than predicted.
+    """
+    if "twa" not in fix.columns or "speed" not in fix.columns:
+        return None
+    d = fix[["twa", "speed"]].dropna()
+    if "moving" in fix.columns:
+        d = d[fix.loc[d.index, "moving"].astype(bool)]
+    if len(d) < min_points:
+        return None
+
+    twa = d["twa"].to_numpy(dtype=float)
+    speed = d["speed"].to_numpy(dtype=float)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(
+        r=speed, theta=twa, mode="markers", name="fixes",
+        marker=dict(size=5, color=_rgba("#3d8fd6", 0.45)),
+        hovertemplate="TWA %{theta:.0f}&deg;, %{r:.2f} m/s<extra></extra>"))
+
+    edges = np.linspace(-180, 180, bins + 1)
+    idx = np.clip(np.digitize(twa, edges) - 1, 0, bins - 1)
+    centers, medians = [], []
+    for b in range(bins):
+        sel = speed[idx == b]
+        if sel.size >= 3:
+            centers.append((edges[b] + edges[b + 1]) / 2)
+            medians.append(float(np.median(sel)))
+    if len(centers) >= 3:
+        fig.add_trace(go.Scatterpolar(
+            r=medians, theta=centers, mode="lines+markers", name="median",
+            line=dict(color="#eb6834", width=2),
+            hovertemplate="TWA %{theta:.0f}&deg;: median %{r:.2f} m/s<extra></extra>"))
+
+    fig.update_layout(
+        height=380, margin=dict(l=40, r=40, t=48, b=32),
+        title="Speed by true wind angle (0° = head to wind)",
+        font=dict(size=12), showlegend=False,
+        paper_bgcolor="rgba(0,0,0,0)",
+        polar=dict(
+            bgcolor="rgba(0,0,0,0)",
+            radialaxis=dict(gridcolor=GRID, ticksuffix=" m/s", angle=90),
+            angularaxis=dict(direction="clockwise", rotation=90,
+                             gridcolor=GRID, color=MUTED, dtick=45)))
     return fig
 
 

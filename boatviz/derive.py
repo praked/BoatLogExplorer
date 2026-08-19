@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .geo import ang_diff, bearing_deg, circ_mean_R, haversine_m, wrap180, wrap360
-from .schema import POWER_CHANNELS
+from .schema import POWER_CHANNELS, SAIL_FAULT_OK
 
 DEFAULT_SPEED_WINDOW_S = 5.0
 DEFAULT_D_MIN_M = 3.0
@@ -320,6 +320,122 @@ def _column(df, name):
     if name not in df.columns:
         return np.full(len(df), np.nan)
     return df[name].to_numpy(dtype=float)
+
+
+# ------------------------------------------------------- sail and navigation
+
+# Like power, these read raw rows rather than fixes: the sail logic re-decides
+# every cycle, so collapsing to GPS fixes would throw away most of its state.
+
+def _text(df, name):
+    """A category column as plain strings, "" where absent or null."""
+    if name not in df.columns:
+        return pd.Series([""] * len(df), index=df.index, dtype=object)
+    col = df[name]
+    return col.astype(object).where(col.notna(), "").astype(str)
+
+
+def _time_frac(df, mask):
+    """Fraction of elapsed time the mask holds, weighting each row by its own
+    interval so a logging gap cannot inflate whichever state preceded it."""
+    if len(df) < 2:
+        return float(mask.mean()) if len(df) else 0.0
+    dt = np.clip(np.diff(_epoch_seconds(df["t"])), 0.0, MAX_POWER_GAP_S)
+    total = dt.sum()
+    if total <= 0:
+        return 0.0
+    return float(dt[np.asarray(mask)[:-1]].sum() / total)
+
+
+def sail_summary(df) -> dict:
+    """What the sail logic was doing over the rows handed in."""
+    out = {"n": len(df), "present": False, "frac_sail": np.nan, "frac_motor": np.nan,
+           "frac_beating": np.nan, "frac_motor_assist": np.nan,
+           "n_tacks": 0, "states": {}, "faults": []}
+    if df.empty:
+        return out
+
+    propulsion = _text(df, "propulsion")
+    state = _text(df, "sail_state")
+    out["present"] = bool((propulsion != "").any() or (state != "").any())
+    if not out["present"]:
+        return out
+
+    out["frac_sail"] = _time_frac(df, propulsion == "sail")
+    out["frac_motor"] = _time_frac(df, propulsion == "motor")
+    out["frac_beating"] = _time_frac(df, _text(df, "beating") == "True")
+    out["frac_motor_assist"] = _time_frac(df, _text(df, "motor_assist") == "True")
+
+    seen = state[state != ""]
+    out["states"] = seen.value_counts().to_dict()
+
+    # A tack is a sign change while the value is actually being logged; the
+    # blank stretches between AUTO runs would otherwise each read as two tacks.
+    tack = _column(df, "tack")
+    ok = np.isfinite(tack)
+    if ok.any():
+        s = np.sign(tack[ok])
+        out["n_tacks"] = int((np.diff(s) != 0).sum())
+
+    fault = _text(df, "sail_fault")
+    bad = (fault != "") & (fault != SAIL_FAULT_OK)
+    if bad.any():
+        t = df["t"].to_numpy()
+        for value, i0, i1 in _runs(fault.to_numpy(), bad.to_numpy()):
+            out["faults"].append((value, t[i0], t[i1]))
+    return out
+
+
+def nav_summary(df) -> dict:
+    """How well the autopilot held its line over the rows handed in."""
+    out = {"n": 0, "present": False, "wp_start": np.nan, "wp_end": np.nan,
+           "mean_abs_err": np.nan, "rms_xte": np.nan, "max_abs_xte": np.nan,
+           "dist_end": np.nan}
+    if df.empty:
+        return out
+
+    des = _column(df, "des_hdg_deg")
+    ok = np.isfinite(des)
+    out["n"] = int(ok.sum())
+    out["present"] = bool(out["n"])
+    if not out["present"]:
+        return out
+
+    err = _column(df, "err_deg")
+    err = err[np.isfinite(err)]
+    if err.size:
+        out["mean_abs_err"] = float(np.mean(np.abs(err)))
+
+    xte = _column(df, "xte_m")
+    xte = xte[np.isfinite(xte)]
+    if xte.size:
+        out["rms_xte"] = float(np.sqrt(np.mean(xte ** 2)))
+        out["max_abs_xte"] = float(np.max(np.abs(xte)))
+
+    wp = _column(df, "wp_left")
+    wp = wp[np.isfinite(wp)]
+    if wp.size:
+        out["wp_start"], out["wp_end"] = float(wp[0]), float(wp[-1])
+
+    dist = _column(df, "dist_m")
+    dist = dist[np.isfinite(dist)]
+    if dist.size:
+        out["dist_end"] = float(dist[-1])
+    return out
+
+
+def _runs(values, mask):
+    """Contiguous runs where mask holds, as (value, first index, last index)."""
+    spans, start = [], None
+    for i, on in enumerate(mask):
+        if on and start is None:
+            start = i
+        elif not on and start is not None:
+            spans.append((values[start], start, i - 1))
+            start = None
+    if start is not None:
+        spans.append((values[start], start, len(mask) - 1))
+    return spans
 
 
 def _energy_wh(ts, w):
